@@ -1,17 +1,12 @@
-# 1. Builder stage with Python 3.14
-FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim AS builder
+# 1. Builder stage with Python 3.12
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
 
 ENV UV_COMPILE_BYTECODE=1
 ENV UV_LINK_MODE=copy
 
 WORKDIR /app
 
-# Install system C compiler / build dependencies required for compiling wheels
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
-# Mount caches to speed up builds
+# Mount caches to speed up builds (no compiler needed for 3.12)
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
@@ -23,7 +18,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
 # 2. Final runtime image
-FROM python:3.14-rc-slim-bookworm
+FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 
