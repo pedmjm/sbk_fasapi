@@ -1,22 +1,34 @@
 """
-Database seed script. Ports the three Laravel seeders:
+Database seed script. Ports the Laravel seeders and adds Consumibles:
 
   * PersonalSeeder     — 10 real technicians (cédulas V-…)
-  * HerramientaSeeder  — ~25 tools (Craftsman, DeWalt, Salisbury, ...)
-  * ClienteSeeder      — 4 clientes (Mimesa, Heinz, Cofasa, Polar) with
-                         their sucursales + contactos
+  * HerramientaSeeder  — Herramientas clasificadas por Tipo y Grupo
+  * ConsumibleSeeder   — Consumibles extraídos de insumos de taller/campo
+  * ClienteSeeder      — 4 clientes (Mimesa, Heinz, Cofasa, Polar) con
+                         sus sucursales + contactos
 
 Run via:  python seed.py
 """
 from __future__ import annotations
 
 import asyncio
+import enum
 import logging
 
 from sqlalchemy import select
 
 from database import async_session, create_db_and_tables
-from models import Cliente, Contacto, Herramienta, Personal, Sucursal, TipoHerramienta
+from models import (
+    Cliente,
+    Contacto,
+    Consumible,
+    GrupoHerramienta,
+    Herramienta,
+    Personal,
+    Sucursal,
+    TipoConsumible,
+    TipoHerramienta,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("seed")
@@ -41,33 +53,235 @@ PERSONALES = [
 # ─── Herramientas ───────────────────────────────────────────────────────────
 
 HERRAMIENTAS = [
-    {"nombre": "Juego de Ratchet y Dados", "marca": "Craftsman", "tipo": "Manual", "combustible": "N/A"},
-    {"nombre": "Termo para Agua 20 Lts.", "marca": "Potamo", "tipo": "Logístico", "combustible": "N/A"},
-    {"nombre": "Segueta", "marca": "Sin Marca", "tipo": "Manual", "combustible": "N/A"},
-    {"nombre": "Llaves eléctricas de Impacto", "marca": "Sin Marca", "tipo": "Inalámbrico", "combustible": "Batería"},
-    {"nombre": 'Taladro 1/2" con mechas', "marca": "DeWalt", "tipo": "Inalámbrico", "combustible": "Batería / Eléctrica"},
-    {"nombre": "Detector de Voltaje con pértiga SALISBURY #4744", "marca": "Salisbury", "tipo": "Medición", "combustible": "Batería"},
-    {"nombre": "Extensiones eléctricas", "marca": "Sin Marca", "tipo": "Eléctrico", "combustible": "N/A"},
-    {"nombre": "Cajas de Herramientas con ruedas CRAFTSMAN", "marca": "Craftsman", "tipo": "Almacenamiento", "combustible": "N/A"},
-    {"nombre": "Juegos de llaves Allen varias", "marca": "Toolmex", "tipo": "Manual", "combustible": "N/A"},
-    {"nombre": "Multímetro digital marca Greenlee", "marca": "Greenlee", "tipo": "Medición", "combustible": "Batería 9V"},
-    {"nombre": "Cajas con consumibles (Teipe, lanilla, cremas limpiadoras, desplazante de humedad, lubricantes, amarres)", "marca": "3M", "tipo": "Almacenamiento", "combustible": "N/A"},
-    {"nombre": 'Taladro de mano de 3/8" con Juego de mechas varias', "marca": "Craftsman", "tipo": "Inalámbrico", "combustible": "Batería"},
-    {"nombre": 'Esmeril de mano 4 1/2" inalámbrico', "marca": "Sin Marca", "tipo": "Inalámbrico", "combustible": "Batería"},
-    {"nombre": 'Esmeril de mano 1/2" con enchufe', "marca": "Ryobi", "tipo": "Eléctrico", "combustible": "Cable 110V/220V"},
-    {"nombre": "Soplador Industrial", "marca": "Ryobi", "tipo": "Eléctrico", "combustible": "Cable 110V/220V"},
-    {"nombre": "Ratchet inalámbrico", "marca": "ACDelco", "tipo": "Inalámbrico", "combustible": "Batería"},
-    {"nombre": "Bolso con Herramientas", "marca": "Serbreka", "tipo": "Almacenamiento", "combustible": "N/A"},
-    {"nombre": "Cepillo de barrer con pala", "marca": "Sin Marca", "tipo": "Logístico", "combustible": "N/A"},
-    {"nombre": "Tornillos varios", "marca": "Sin Marca", "tipo": "Almacenamiento", "combustible": "N/A"},
-    {"nombre": "Arnés de seguridad", "marca": "Sin Marca", "tipo": "Seguridad", "combustible": "N/A"},
-    {"nombre": "Contenedor plástico", "marca": "Sin Marca", "tipo": "Almacenamiento", "combustible": "N/A"},
-    {"nombre": "Careta para esmerilar", "marca": "Sin Marca", "tipo": "Seguridad", "combustible": "N/A"},
-    {"nombre": "Extintor de fuego CO2", "marca": "Sin Marca", "tipo": "Seguridad", "combustible": "N/A"},
-    {"nombre": "Reflectores con pedestal", "marca": "Sin Marca", "tipo": "Eléctrico", "combustible": "Cable 110V/220V"},
-    {"nombre": "Guantes de alta tensión", "marca": "Sin Marca", "tipo": "Seguridad", "combustible": "N/A"},
-    {"nombre": "Bolso de Herramientas varias", "marca": "Sin Marca", "tipo": "Almacenamiento", "combustible": "N/A"},
-    {"nombre": "Cinta Métrica", "marca": "Sin Marca", "tipo": "Medición", "combustible": "N/A"},
+    {
+        "nombre": "Juego de Ratchet y Dados",
+        "marca": "Craftsman",
+        "tipo": TipoHerramienta.MANUAL,
+        "grupo": GrupoHerramienta.MECANICA_LIGERA,
+        "combustible": "N/A",
+    },
+    {
+        "nombre": "Termo para Agua 20 Lts.",
+        "marca": "Potamo",
+        "tipo": TipoHerramienta.LOGISTICO,
+        "grupo": GrupoHerramienta.LOGISTICA_ASEO,
+        "combustible": "N/A",
+    },
+    {
+        "nombre": "Segueta",
+        "marca": "Sin Marca",
+        "tipo": TipoHerramienta.MANUAL,
+        "grupo": GrupoHerramienta.MECANICA_LIGERA,
+        "combustible": "N/A",
+    },
+    {
+        "nombre": "Llaves eléctricas de Impacto",
+        "marca": "Sin Marca",
+        "tipo": TipoHerramienta.INALAMBRICO,
+        "grupo": GrupoHerramienta.POTENCIA_ELECTROPORTATIL,
+        "combustible": "Batería",
+    },
+    {
+        "nombre": 'Taladro 1/2" con mechas',
+        "marca": "DeWalt",
+        "tipo": TipoHerramienta.INALAMBRICO,
+        "grupo": GrupoHerramienta.POTENCIA_ELECTROPORTATIL,
+        "combustible": "Batería / Eléctrica",
+    },
+    {
+        "nombre": "Detector de Voltaje con pértiga SALISBURY #4744",
+        "marca": "Salisbury",
+        "tipo": TipoHerramienta.MEDICION,
+        "grupo": GrupoHerramienta.MEDICION_DIAGNOSTICO,
+        "combustible": "Batería",
+    },
+    {
+        "nombre": "Extensiones eléctricas",
+        "marca": "Sin Marca",
+        "tipo": TipoHerramienta.ELECTRICO,
+        "grupo": GrupoHerramienta.INFRAESTRUCTURA_ELECTRICA,
+        "combustible": "N/A",
+    },
+    {
+        "nombre": "Cajas de Herramientas con ruedas CRAFTSMAN",
+        "marca": "Craftsman",
+        "tipo": TipoHerramienta.ALMACENAMIENTO,
+        "grupo": GrupoHerramienta.ALMACENAMIENTO_CONSUMIBLES,
+        "combustible": "N/A",
+    },
+    {
+        "nombre": "Juegos de llaves Allen varias",
+        "marca": "Toolmex",
+        "tipo": TipoHerramienta.MANUAL,
+        "grupo": GrupoHerramienta.MECANICA_LIGERA,
+        "combustible": "N/A",
+    },
+    {
+        "nombre": "Multímetro digital marca Greenlee",
+        "marca": "Greenlee",
+        "tipo": TipoHerramienta.MEDICION,
+        "grupo": GrupoHerramienta.MEDICION_DIAGNOSTICO,
+        "combustible": "Batería 9V",
+    },
+    {
+        "nombre": 'Taladro de mano de 3/8" con Juego de mechas varias',
+        "marca": "Craftsman",
+        "tipo": TipoHerramienta.INALAMBRICO,
+        "grupo": GrupoHerramienta.POTENCIA_ELECTROPORTATIL,
+        "combustible": "Batería",
+    },
+    {
+        "nombre": 'Esmeril de mano 4 1/2" inalámbrico',
+        "marca": "Sin Marca",
+        "tipo": TipoHerramienta.INALAMBRICO,
+        "grupo": GrupoHerramienta.POTENCIA_ELECTROPORTATIL,
+        "combustible": "Batería",
+    },
+    {
+        "nombre": 'Esmeril de mano 1/2" con enchufe',
+        "marca": "Ryobi",
+        "tipo": TipoHerramienta.ELECTRICO,
+        "grupo": GrupoHerramienta.POTENCIA_ELECTROPORTATIL,
+        "combustible": "Cable 110V/220V",
+    },
+    {
+        "nombre": "Soplador Industrial",
+        "marca": "Ryobi",
+        "tipo": TipoHerramienta.ELECTRICO,
+        "grupo": GrupoHerramienta.POTENCIA_ELECTROPORTATIL,
+        "combustible": "Cable 110V/220V",
+    },
+    {
+        "nombre": "Ratchet inalámbrico",
+        "marca": "ACDelco",
+        "tipo": TipoHerramienta.INALAMBRICO,
+        "grupo": GrupoHerramienta.POTENCIA_ELECTROPORTATIL,
+        "combustible": "Batería",
+    },
+    {
+        "nombre": "Bolso con Herramientas",
+        "marca": "Serbreka",
+        "tipo": TipoHerramienta.ALMACENAMIENTO,
+        "grupo": GrupoHerramienta.ALMACENAMIENTO_CONSUMIBLES,
+        "combustible": "N/A",
+    },
+    {
+        "nombre": "Cepillo de barrer con pala",
+        "marca": "Sin Marca",
+        "tipo": TipoHerramienta.LOGISTICO,
+        "grupo": GrupoHerramienta.LOGISTICA_ASEO,
+        "combustible": "N/A",
+    },
+    {
+        "nombre": "Arnés de seguridad",
+        "marca": "Sin Marca",
+        "tipo": TipoHerramienta.SEGURIDAD,
+        "grupo": GrupoHerramienta.SEGURIDAD_EPP,
+        "combustible": "N/A",
+    },
+    {
+        "nombre": "Contenedor plástico",
+        "marca": "Sin Marca",
+        "tipo": TipoHerramienta.ALMACENAMIENTO,
+        "grupo": GrupoHerramienta.ALMACENAMIENTO_CONSUMIBLES,
+        "combustible": "N/A",
+    },
+    {
+        "nombre": "Careta para esmerilar",
+        "marca": "Sin Marca",
+        "tipo": TipoHerramienta.SEGURIDAD,
+        "grupo": GrupoHerramienta.SEGURIDAD_EPP,
+        "combustible": "N/A",
+    },
+    {
+        "nombre": "Extintor de fuego CO2",
+        "marca": "Sin Marca",
+        "tipo": TipoHerramienta.SEGURIDAD,
+        "grupo": GrupoHerramienta.SEGURIDAD_EPP,
+        "combustible": "N/A",
+    },
+    {
+        "nombre": "Reflectores con pedestal",
+        "marca": "Sin Marca",
+        "tipo": TipoHerramienta.ELECTRICO,
+        "grupo": GrupoHerramienta.INFRAESTRUCTURA_ELECTRICA,
+        "combustible": "Cable 110V/220V",
+    },
+    {
+        "nombre": "Guantes de alta tensión",
+        "marca": "Sin Marca",
+        "tipo": TipoHerramienta.SEGURIDAD,
+        "grupo": GrupoHerramienta.SEGURIDAD_EPP,
+        "combustible": "N/A",
+    },
+    {
+        "nombre": "Bolso de Herramientas varias",
+        "marca": "Sin Marca",
+        "tipo": TipoHerramienta.ALMACENAMIENTO,
+        "grupo": GrupoHerramienta.ALMACENAMIENTO_CONSUMIBLES,
+        "combustible": "N/A",
+    },
+    {
+        "nombre": "Cinta Métrica",
+        "marca": "Sin Marca",
+        "tipo": TipoHerramienta.MEDICION,
+        "grupo": GrupoHerramienta.MEDICION_DIAGNOSTICO,
+        "combustible": "N/A",
+    },
+]
+
+
+# ─── Consumibles ────────────────────────────────────────────────────────────
+
+CONSUMIBLES = [
+    {
+        "nombre": "Teipe eléctrico",
+        "descripcion": "Teipe/cinta aislante de alta calidad (3M)",
+        "tipo": TipoConsumible.ELECTRICO,
+        "unidad_medida": "rollo",
+        "stock_actual": 20,
+        "stock_minimo": 5,
+    },
+    {
+        "nombre": "Lanilla de limpieza",
+        "descripcion": "Lanilla/trapo industrial para limpieza de equipos",
+        "tipo": TipoConsumible.LIMPIEZA,
+        "unidad_medida": "kg",
+        "stock_actual": 10,
+        "stock_minimo": 2,
+    },
+    {
+        "nombre": "Cremas limpiadoras / Desengrasantes",
+        "descripcion": "Crema o desengrasante para limpieza de componentes",
+        "tipo": TipoConsumible.LIMPIEZA,
+        "unidad_medida": "unidad",
+        "stock_actual": 8,
+        "stock_minimo": 2,
+    },
+    {
+        "nombre": "Desplazante de humedad / Lubricantes (WD-40)",
+        "descripcion": "Spray desplazante de humedad y lubricante multipropósito",
+        "tipo": TipoConsumible.MECANICO,
+        "unidad_medida": "lata",
+        "stock_actual": 12,
+        "stock_minimo": 3,
+    },
+    {
+        "nombre": "Amarres plásticos (Tirraps)",
+        "descripcion": "Amarres plásticos de varios tamaños",
+        "tipo": TipoConsumible.ELECTRICO,
+        "unidad_medida": "paquete",
+        "stock_actual": 15,
+        "stock_minimo": 5,
+    },
+    {
+        "nombre": "Tornillos varios",
+        "descripcion": "Surtido de tornillos, tuercas y arandelas",
+        "tipo": TipoConsumible.MECANICO,
+        "unidad_medida": "caja",
+        "stock_actual": 10,
+        "stock_minimo": 3,
+    },
 ]
 
 
@@ -136,8 +350,34 @@ async def seed_herramientas(session) -> int:
         session.add(Herramienta(
             nombre=h_data["nombre"],
             marca=h_data["marca"],
-            tipo=TipoHerramienta(h_data["tipo"]),
+            tipo=h_data["tipo"],
+            grupo=h_data["grupo"],
             combustible=h_data["combustible"],
+            estado="Disponible",
+        ))
+        count += 1
+    return count
+
+
+async def seed_consumibles(session) -> int:
+    count = 0
+    for c_data in CONSUMIBLES:
+        existing = (
+            await session.execute(
+                select(Consumible).where(
+                    Consumible.nombre == c_data["nombre"],
+                )
+            )
+        ).scalar_one_or_none()
+        if existing:
+            continue
+        session.add(Consumible(
+            nombre=c_data["nombre"],
+            descripcion=c_data["descripcion"],
+            tipo=c_data["tipo"],
+            unidad_medida=c_data["unidad_medida"],
+            stock_actual=c_data["stock_actual"],
+            stock_minimo=c_data["stock_minimo"],
             estado="Disponible",
         ))
         count += 1
@@ -192,9 +432,13 @@ async def main() -> None:
         async with session.begin():
             n_p = await seed_personales(session)
             n_h = await seed_herramientas(session)
+            n_con = await seed_consumibles(session)
             n_c = await seed_clientes(session)
-        log.info("Seeded: %d personales, %d herramientas, %d clientes.", n_p, n_h, n_c)
-        if n_p == 0 and n_h == 0 and n_c == 0:
+        log.info(
+            "Seeded: %d personales, %d herramientas, %d consumibles, %d clientes.",
+            n_p, n_h, n_con, n_c
+        )
+        if n_p == 0 and n_h == 0 and n_con == 0 and n_c == 0:
             log.info("(Everything already present — nothing inserted.)")
 
 

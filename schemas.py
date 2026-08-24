@@ -209,6 +209,7 @@ class HerramientaUpdate(BaseModel):
     nombre: Optional[str] = Field(None, max_length=255)
     marca: Optional[str] = Field(None, max_length=255)
     serial: Optional[str] = None
+    grupo: Optional[str] = None
     tipo: Optional[str] = None
     combustible: Optional[str] = Field(None, max_length=100)
     estado: Optional[str] = Field(None, max_length=50)
@@ -218,7 +219,10 @@ class HerramientaOut(BaseModel):
     id: uuid.UUID
     nombre: str
     marca: Optional[str] = None
+    grupo: Optional[str] = None
     serial: Optional[str] = None
+    stock_minimo: int
+    stock_actual: int
     tipo: str
     combustible: str
     estado: str
@@ -294,6 +298,13 @@ class TareaCreate(BaseModel):
     personal_ids: list[uuid.UUID] = Field(default_factory=list)
     herramienta_ids: list[uuid.UUID] = Field(default_factory=list)
     pasos: list[PasoCreate] = Field(default_factory=list)
+    consumible_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
+class ItemWithCantidad(BaseModel):
+    """Item con cantidad para asignar a una tarea."""
+    id: uuid.UUID
+    cantidad: int = 1
 
 
 class TareaUpdate(BaseModel):
@@ -305,7 +316,9 @@ class TareaUpdate(BaseModel):
     fecha_programada: Optional[date] = None
     fecha_limite: Optional[date] = None
     personal_ids: Optional[list[uuid.UUID]] = None
-    herramienta_ids: Optional[list[uuid.UUID]] = None
+    # ✅ Cambiado: ahora acepta items con cantidad
+    herramienta_ids: Optional[list[ItemWithCantidad]] = None
+    consumible_ids: Optional[list[ItemWithCantidad]] = None
 
 
 class TareaOut(BaseModel):
@@ -319,6 +332,7 @@ class TareaOut(BaseModel):
     fecha_limite: Optional[date] = None
     creador_id: uuid.UUID
     created_at: datetime
+    estado: str
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -333,6 +347,7 @@ class TareaNested(TareaOut):
     pasos: list[PasoOut] = Field(default_factory=list)
     comentarios: list[ComentarioOut] = Field(default_factory=list)
     imagenes: list[ImagenOut] = Field(default_factory=list)
+    consumibles: list[ConsumibleOut] = Field(default_factory=list)
 
 
 # ─── Generic envelope + notification schemas ────────────────────────────────
@@ -355,3 +370,182 @@ class NotificationRequest(BaseModel):
 # which is defined later in this file).
 ClienteNested.model_rebuild()
 SucursalNested.model_rebuild()
+
+
+# ─── Consumible Schemas ─────────────────────────────────────────────────────
+
+class ConsumibleCreate(BaseModel):
+    nombre: str
+    descripcion: Optional[str] = None
+    tipo: Optional[str] = None
+    unidad_medida: str = "unidad"
+    stock_actual: int = 0
+    stock_minimo: int = 5
+    estado: str = "Disponible"
+
+class ConsumibleUpdate(BaseModel):
+    nombre: Optional[str] = None
+    descripcion: Optional[str] = None
+    tipo: Optional[str] = None
+    unidad_medida: Optional[str] = None
+    stock_actual: Optional[int] = None
+    stock_minimo: Optional[int] = None
+    estado: Optional[str] = None
+
+class ConsumibleOut(BaseModel):
+    id: uuid.UUID
+    nombre: str
+    descripcion: Optional[str] = None
+    tipo: str
+    unidad_medida: str
+    stock_actual: int
+    stock_minimo: int
+    estado: str
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ─── Picking Schemas ────────────────────────────────────────────────────────
+
+class PickingItemCreate(BaseModel):
+    """Ítem que el creador agrega al picking."""
+    item_type: str  # "herramienta" | "consumible"
+    item_id: uuid.UUID
+    cantidad: int = 1
+
+class PickingItemOut(BaseModel):
+    id: uuid.UUID
+    picking_id: uuid.UUID
+    item_type: str
+    item_id: Optional[uuid.UUID] = None
+    nombre: str
+    detalle: Optional[str] = None
+    estado: str
+    actualizado_por_id: Optional[uuid.UUID] = None
+    cantidad_solicitada: int
+    cantidad_tomada: int
+    notas: Optional[str] = None
+    agregado_por_tecnico: bool
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+class PickingCreate(BaseModel):
+    """Cuerpo para crear un picking."""
+    referencia: str
+    motivo: str
+    personal_ids: list[uuid.UUID] = []  # IDs del personal asignado
+    items: list[PickingItemCreate] = []  # Herramientas y consumibles iniciales
+
+class PickingUpdate(BaseModel):
+    """Actualización parcial del picking (solo campos editables por creador)."""
+    referencia: Optional[str] = None
+    motivo: Optional[str] = None
+    estado: Optional[str] = None  # Solo para cancelar desde creador
+    personal_ids: Optional[list[uuid.UUID]] = None  # Reemplaza la lista completa
+
+class PickingItemEstadoUpdate(BaseModel):
+    """El técnico actualiza el estado de un ítem."""
+    estado: str  # "tomado" | "no_disponible" | "innecesario"
+    cantidad_tomada: Optional[int] = None
+    notas: Optional[str] = None
+
+class PickingItemAddByTecnico(BaseModel):
+    """El técnico agrega un ítem que no estaba en la lista original."""
+    item_type: str  # "herramienta" | "consumible"
+    nombre: Optional[str] = None
+    detalle: Optional[str] = None
+    item_id: Optional[uuid.UUID] = None  # Si existe en el catálogo
+    cantidad: int = 1
+    notas: Optional[str] = None
+
+class PersonalAsignadoOut(BaseModel):
+    id: uuid.UUID
+    nombre: str
+    cedula: str
+    cargo: Optional[str] = None
+    activo: bool
+
+    model_config = ConfigDict(from_attributes=True)
+
+class PickingOut(BaseModel):
+    id: uuid.UUID
+    referencia: str
+    motivo: str
+    estado: str
+    creador_id: uuid.UUID
+    progreso: int
+    created_at: datetime
+    updated_at: datetime
+    # Relaciones
+    personal_asignado: list[PersonalAsignadoOut] = []
+    items: list[PickingItemOut] = []
+    utilizado: bool = False
+
+    model_config = ConfigDict(from_attributes=True)
+
+class PickingListOut(BaseModel):
+    """Versión ligera para listados."""
+    id: uuid.UUID
+    referencia: str
+    motivo: str
+    estado: str
+    creador_id: uuid.UUID
+    progreso: int
+    total_items: int = 0
+    items_completados: int = 0
+    created_at: datetime
+    updated_at: datetime
+    personal_asignado: list[PersonalAsignadoOut] = []
+    utilizado: bool = False
+
+    model_config = ConfigDict(from_attributes=True)
+
+class PickingCloneData(BaseModel):
+    referencia: str
+    motivo: str
+    personal_ids: list[uuid.UUID]
+    items: list[PickingItemCreate]
+
+class TareaHerramientaEstadoUpdate(BaseModel):
+    estado: str  # "asignada", "en_uso", "devuelta"
+    personal_id: Optional[uuid.UUID] = None
+    observaciones: Optional[str] = None
+
+class TareaConsumibleEstadoUpdate(BaseModel):
+    estado: str  # "asignado", "en_uso", "consumido"
+    personal_id: Optional[uuid.UUID] = None
+    observaciones: Optional[str] = None
+
+class HerramientaEstadoOut(BaseModel):
+    id: uuid.UUID
+    tarea_id: uuid.UUID
+    herramienta_id: uuid.UUID
+    cantidad_asignada: int = 1
+    cantidad_devuelta: int = 0
+    estado: str
+    fecha_inicio: datetime
+    fecha_fin: Optional[datetime] = None
+    observaciones: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+class ConsumibleEstadoOut(BaseModel):
+    id: uuid.UUID
+    tarea_id: uuid.UUID
+    consumible_id: uuid.UUID
+    cantidad_asignada: int = 1
+    cantidad_devuelta: int = 0
+    estado: str
+    fecha_inicio: datetime
+    fecha_fin: Optional[datetime] = None
+    observaciones: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)

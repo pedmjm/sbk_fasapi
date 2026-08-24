@@ -71,6 +71,52 @@ class TipoHerramienta(str, enum.Enum):
     LOGISTICO = "Logístico"
     MANUAL = "Manual"
 
+class GrupoHerramienta(str, enum.Enum):
+    MECANICA_LIGERA = "Mecánica Ligera"
+    POTENCIA_ELECTROPORTATIL = "Herramientas de Potencia"
+    MEDICION_DIAGNOSTICO = "Medición y Diagnóstico"
+    SEGURIDAD_EPP = "Seguridad y EPP"
+    ALMACENAMIENTO_CONSUMIBLES = "Almacenamiento y Consumibles"
+    INFRAESTRUCTURA_ELECTRICA = "Infraestructura Eléctrica"
+    LOGISTICA_ASEO = "Logística y Aseo"
+    SOLDADURA_CORTE_TERMICO = "Soldadura y Corte Térmico"
+    NEUMATICA_HIDRAULICA = "Neumática e Hidráulica"
+    IZAJE_CARGAS = "Izaje y Levantamiento de Cargas"
+    PINTURA_ACABADOS = "Pintura y Acabados"
+    TUBERIAS = "Tuberías"
+    TOPOGRAFIA_NIVELACION = "Topografía y Nivelación"
+    # JARDINERIA_EXTERIORES = "Jardinería y Áreas Verdes"
+
+class TipoConsumible(str, enum.Enum):
+    ELECTRICO = "Eléctrico"
+    MECANICO = "Mecánico"
+    SEGURIDAD = "Seguridad"
+    LIMPIEZA = "Limpieza"
+    SOLDADURA = "Soldadura"
+    PINTURA = "Pintura"
+    TUBERIA = "Tubería"
+    OTRO = "Otro"
+
+
+class EstadoPickingItem(str, enum.Enum):
+    PENDIENTE = "pendiente"
+    TOMADO = "tomado"
+    NO_DISPONIBLE = "no_disponible"
+    INNECESARIO = "innecesario"
+
+
+class EstadoPicking(str, enum.Enum):
+    BORRADOR = "borrador"
+    ASIGNADO = "asignado"
+    EN_PROGRESO = "en_progreso"
+    COMPLETADO = "completado"
+    CANCELADO = "cancelado"
+
+class EstadoTarea(str, enum.Enum):
+    PENDIENTE = "pendiente"
+    EN_PROGRESO = "en_progreso"
+    COMPLETADA = "completada"
+    CANCELADA = "cancelada"
 
 # ─── Association tables (M:N) ────────────────────────────────────────────────
 
@@ -109,23 +155,76 @@ tarea_herramienta = Table(
         ForeignKey("herramientas.id", ondelete="CASCADE"),
         nullable=False,
     ),
+    Column("cantidad",Integer, default=1, nullable=False),
 )
 
+tarea_consumible = Table(
+    "tarea_consumible",
+    Base.metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "tarea_id",
+        Uuid(as_uuid=True),
+        ForeignKey("tareas.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "consumible_id",
+        Uuid(as_uuid=True),
+        ForeignKey("consumibles.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("cantidad",Integer, default=1, nullable=False),
+)
+
+picking_personal = Table(
+    "picking_personal",
+    Base.metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "picking_id",
+        Uuid(as_uuid=True),
+        ForeignKey("pickings.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "personal_id",
+        Uuid(as_uuid=True),
+        ForeignKey("personals.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("created_at", DateTime(timezone=True), server_default=func.now()),
+)
+
+tarea_picking = Table(
+    "tarea_picking",
+    Base.metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "tarea_id",
+        Uuid(as_uuid=True),
+        ForeignKey("tareas.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "picking_id",
+        Uuid(as_uuid=True),
+        ForeignKey("pickings.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("created_at", DateTime(timezone=True), server_default=func.now()),
+)
 
 # ─── Auth user ──────────────────────────────────────────────────────────────
 
 class User(Base):
-    """Auth user. Equivalent to Laravel's `User` model + Sanctum tokens.
-
-    `cedula` is the bridge to `Personal` — when a user registers, their
-    cédula must already exist in the `personals` whitelist (mirrors the
-    Laravel AuthController behaviour).
-    """
     __tablename__ = "users"
 
+    # id toma como FK el id de personal
     id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("personals.id", ondelete="CASCADE"),
         primary_key=True,
-        default=uuid.uuid4,
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
@@ -147,7 +246,8 @@ class User(Base):
         nullable=False,
     )
 
-    # Relationships
+    # Relación bidireccional opcional con Personal
+    personal: Mapped[Optional["Personal"]] = relationship(back_populates="usuario")
     tareas_creadas: Mapped[list["Tarea"]] = relationship(
         back_populates="creador",
         foreign_keys="Tarea.creador_id",
@@ -162,12 +262,6 @@ class User(Base):
 # ─── Personal (técnico whitelist) ───────────────────────────────────────────
 
 class Personal(Base):
-    """A technician. Equivalent to Laravel's `Personal` model.
-
-    This is the pre-registration whitelist: a User can only register if
-    their `cedula` matches a row here. Personal can also exist without
-    a linked User (e.g. an inactive technician).
-    """
     __tablename__ = "personals"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -176,7 +270,6 @@ class Personal(Base):
     correo: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     telefono: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     cargo: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    # 0 = Técnico, 1 = Moderador, 2 = Admin, 5 = Super Admin
     tipo_usuario: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     activo: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
@@ -190,11 +283,15 @@ class Personal(Base):
         nullable=False,
     )
 
-    # M:N with Tarea
+    usuario: Mapped[Optional["User"]] = relationship(
+        back_populates="personal", uselist=False, cascade="all, delete-orphan"
+    )
     tareas: Mapped[list["Tarea"]] = relationship(
         secondary=tarea_personal, back_populates="personal"
     )
-
+    pickings_asignados: Mapped[list["Picking"]] = relationship(
+        secondary=picking_personal, back_populates="personal_asignado"
+    )
 
 # ─── Cliente → Sucursal → Contacto hierarchy ────────────────────────────────
 
@@ -299,6 +396,13 @@ class Herramienta(Base):
         default=TipoHerramienta.MANUAL,
         nullable=False,
     )
+    grupo: Mapped[GrupoHerramienta] = mapped_column(
+        Enum(GrupoHerramienta, name='grupo_herramienta'),
+        default="",
+        nullable=True,
+        )
+    stock_actual: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    stock_minimo: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
     combustible: Mapped[str] = mapped_column(String(100), default="N/A", nullable=False)
     estado: Mapped[str] = mapped_column(String(50), default="Disponible", nullable=False)
 
@@ -316,6 +420,156 @@ class Herramienta(Base):
         secondary=tarea_herramienta, back_populates="herramientas"
     )
 
+# ─── Consumible ─────────────────────────────────────────────────────────────
+
+class Consumible(Base):
+    """Insumos y materiales consumibles del inventario."""
+    __tablename__ = "consumibles"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    nombre: Mapped[str] = mapped_column(String(255), nullable=False)
+    descripcion: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    tipo: Mapped[TipoConsumible] = mapped_column(
+        Enum(TipoConsumible, name="tipo_consumible"),
+        default=TipoConsumible.OTRO,
+        nullable=False,
+    )
+    unidad_medida: Mapped[str] = mapped_column(
+        String(50), default="unidad", nullable=False
+    )
+    stock_actual: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    stock_minimo: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
+    estado: Mapped[str] = mapped_column(
+        String(50), default="Disponible", nullable=False
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+    tareas: Mapped[list["Tarea"]] = relationship(
+        secondary=tarea_consumible, back_populates="consumibles"
+    )
+
+
+# ─── Picking ────────────────────────────────────────────────────────────────
+
+class Picking(Base):
+    """Orden de picking: lista de herramientas y consumibles a recoger."""
+    __tablename__ = "pickings"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    referencia: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    motivo: Mapped[str] = mapped_column(Text, nullable=False)
+    estado: Mapped[EstadoPicking] = mapped_column(
+        Enum(EstadoPicking, name="estado_picking"),
+        default=EstadoPicking.BORRADOR,
+        nullable=False,
+    )
+    creador_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    utilizado: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Progreso calculado 0-100 (se actualiza vía trigger o lógica de negocio)
+    progreso: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    # Relationships
+    creador: Mapped["User"] = relationship()
+    personal_asignado: Mapped[list["Personal"]] = relationship(
+        secondary=picking_personal, back_populates="pickings_asignados"
+    )
+    items: Mapped[list["PickingItem"]] = relationship(
+        back_populates="picking",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="PickingItem.item_type, PickingItem.nombre",
+    )
+    tareas: Mapped[list["Tarea"]] = relationship(
+        secondary=tarea_picking, back_populates="pickings"
+    )
+
+
+# ─── PickingItem ────────────────────────────────────────────────────────────
+
+class PickingItem(Base):
+    """Un ítem dentro de una orden de picking.
+
+    `item_type` discrimina entre "herramienta" y "consumible".
+    `item_id` apunta al registro original (nullable para ítems agregados
+    manualmente por el técnico).
+    Los campos `nombre` y `detalle` están denormalizados para preservar
+    la información aunque el original cambie o se elimine.
+    """
+    __tablename__ = "picking_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    picking_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("pickings.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # "herramienta" | "consumible"
+    item_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    # FK al registro original (nullable si el técnico lo agregó de forma libre)
+    item_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        Uuid(as_uuid=True), nullable=True
+    )
+    # Datos denormalizados
+    nombre: Mapped[str] = mapped_column(String(255), nullable=False)
+    detalle: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Estado
+    estado: Mapped[EstadoPickingItem] = mapped_column(
+        Enum(EstadoPickingItem, name="estado_picking_item"),
+        default=EstadoPickingItem.PENDIENTE,
+        nullable=False,
+    )
+    # Último usuario que modificó el estado
+    actualizado_por_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # Cantidades
+    cantidad_solicitada: Mapped[int] = mapped_column(
+        Integer, default=1, nullable=False
+    )
+    cantidad_tomada: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Notas del técnico
+    notas: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Flag: ¿fue agregado por el técnico después de la creación?
+    agregado_por_tecnico: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    # Relationships
+    picking: Mapped["Picking"] = relationship(back_populates="items")
+    actualizado_por: Mapped[Optional["User"]] = relationship()
 
 # ─── Tarea + Pasos + Comentarios + Imagenes ─────────────────────────────────
 
@@ -357,6 +611,11 @@ class Tarea(Base):
         onupdate=func.now(),
         nullable=False,
     )
+    estado: Mapped[EstadoTarea] = mapped_column(
+        Enum(EstadoTarea, name="estado_tarea"),
+        default=EstadoTarea.PENDIENTE,
+        nullable=False,
+    )
 
     # Relationships
     cliente: Mapped[Cliente] = relationship()
@@ -370,6 +629,9 @@ class Tarea(Base):
     herramientas: Mapped[list[Herramienta]] = relationship(
         secondary=tarea_herramienta, back_populates="tareas"
     )
+    consumibles: Mapped[list["Consumible"]] = relationship(
+        secondary=tarea_consumible, back_populates="tareas"
+    )
     pasos: Mapped[list["PasosTarea"]] = relationship(
         back_populates="tarea",
         cascade="all, delete-orphan",
@@ -381,6 +643,14 @@ class Tarea(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
         order_by="Comentario.created_at.desc()",
+    )
+    pickings: Mapped[list["Picking"]] = relationship(
+        secondary=tarea_picking, back_populates="tareas"
+    )
+    herramientas_estado: Mapped[list["TareaHerramientaEstado"]] = relationship(
+        back_populates="tarea",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 
@@ -479,3 +749,97 @@ class Imagen(Base):
     @property
     def parent_kind(self) -> str:
         return self.imageable_type
+
+class TareaHerramientaEstado(Base):
+    __tablename__ = "tarea_herramienta_estado"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    tarea_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tareas.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    herramienta_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("herramientas.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    personal_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        ForeignKey("personals.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    cantidad_asignada: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    cantidad_devuelta: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    estado: Mapped[str] = mapped_column(
+        String(50), default="asignada", nullable=False
+    )
+    fecha_inicio: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    fecha_fin: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    observaciones: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    # Relaciones
+    tarea: Mapped["Tarea"] = relationship()
+    herramienta: Mapped["Herramienta"] = relationship()
+    personal: Mapped[Optional["Personal"]] = relationship()
+
+
+class TareaConsumibleEstado(Base):
+    __tablename__ = "tarea_consumible_estado"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    tarea_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tareas.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    consumible_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("consumibles.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    personal_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        ForeignKey("personals.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    cantidad_asignada: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    cantidad_devuelta: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    estado: Mapped[str] = mapped_column(
+        String(50), default="asignado", nullable=False
+    )
+    fecha_inicio: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    fecha_fin: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    observaciones: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    # Relaciones
+    tarea: Mapped["Tarea"] = relationship()
+    consumible: Mapped["Consumible"] = relationship()
+    personal: Mapped[Optional["Personal"]] = relationship()

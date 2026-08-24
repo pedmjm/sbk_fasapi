@@ -32,6 +32,8 @@ from routers import (
     personal,
     sucursales,
     tareas,
+    consumibles,
+    picking,
 )
 
 logging.basicConfig(
@@ -78,6 +80,8 @@ app.include_router(contactos.router)
 app.include_router(tareas.router)
 app.include_router(comentarios.router)
 app.include_router(notifications.router)
+app.include_router(consumibles.router)
+app.include_router(picking.router)
 
 
 # ─── Static files (uploaded evidence) ───────────────────────────────────────

@@ -139,7 +139,6 @@ def require_nivel(min_level: int):
         return current_user
     return _checker
 
-
 # Convenience aliases for the common role levels.
 require_tecnico = require_nivel(0)   # any authenticated user
 require_moderador = require_nivel(1)

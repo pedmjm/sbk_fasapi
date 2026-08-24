@@ -68,8 +68,17 @@ async def register(
             detail="Email or cédula already registered.",
         )
 
-    # 3. Create the user — hash exactly once (no double-hash bug).
+    # 3. ✅ Sincronizar la tabla Personal con los datos del formulario
+    personal.nombre = user_data.name
+    personal.correo = user_data.email
+    personal.telefono = user_data.telefono or personal.telefono
+    personal.cargo = user_data.cargo or personal.cargo
+    if user_data.nivel is not None:
+        personal.tipo_usuario = user_data.nivel
+
+    # 4. Create the user usando el mismo ID de personal
     user = User(
+        id=personal.id,
         name=user_data.name,
         email=user_data.email,
         cedula=user_data.cedula,
@@ -87,7 +96,6 @@ async def register(
         access_token=access_token,
         user=UserOut.model_validate(user),
     )
-
 
 @router.post("/login", response_model=Token)
 async def login(
@@ -167,3 +175,4 @@ async def me(
     current_user: Annotated[User, Depends(get_current_active_user)],
 ):
     return current_user
+

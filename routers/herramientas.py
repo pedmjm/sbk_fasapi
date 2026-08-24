@@ -30,6 +30,7 @@ async def list_herramientas(
     _current_user: Annotated[User, Depends(get_current_active_user)],
 ):
     result = await db.execute(select(Herramienta).order_by(Herramienta.nombre.asc()))
+    # print([HerramientaOut.model_validate(h) for h in result.scalars().all()])
     return Envelope(data=[HerramientaOut.model_validate(h) for h in result.scalars().all()])
 
 
