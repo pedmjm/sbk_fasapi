@@ -23,83 +23,91 @@ import httpx
 
 logger = logging.getLogger("sbk.notifications")
 
-ONESIGNAL_APP_ID = os.getenv("ONESIGNAL_APP_ID", "your-onesignal-app-id")
-ONESIGNAL_REST_API_KEY = os.getenv("ONESIGNAL_REST_API_KEY", "your-rest-api-key")
-ONESIGNAL_URL = "https://onesignal.com/api/v1/notifications"
+ONESIGNAL_APP_ID = os.getenv("ONESIGNAL_APP_ID", "onesignal-id")
+ONESIGNAL_REST_API_KEY = os.getenv("ONESIGNAL_REST_API_KEY", "api-key")
+ONESIGNAL_URL = "https://api.onesignal.com/notifications"
 # When disabled, payloads are logged but NOT sent. Defaults to disabled
 # so local dev doesn't need real OneSignal credentials.
-ONESIGNAL_ENABLED = os.getenv("ONESIGNAL_ENABLED", "0") == "1"
+ONESIGNAL_ENABLED = os.getenv("ONESIGNAL_ENABLED", "0")
+
+
 
 
 async def send_push_via_onesignal(
     user_ids: Iterable[str | UUID],
+    *,
     title: str,
     message: str,
+    subtitle: str | None = None,
     data: dict | None = None,
+    small_icon: str | None = None,
+    large_icon: str | None = None,
+    big_picture: str | None = None,
+    buttons: list[dict[str, str]] | None = None,  # [{"id": "view", "text": "Ver tarea"}]
+    android_group: str | None = None,
+    thread_id: str | None = None,          # iOS grouping
+    collapse_id: str | None = None,
+    name: str | None = None,               # dashboard-only label, users never see it
+    extra: dict | None = None,             # escape hatch for anything else
 ) -> dict | None:
-    """Send a push to one or more users (identified by their UUID as
-    OneSignal `external_id`).
-
-    Returns OneSignal's JSON response, or `None` if the call was skipped
-    (ONESIGNAL_ENABLED=0). Raises `HTTPException(502)` if OneSignal
-    returns a non-200 status.
-    """
     external_ids = [str(uid) for uid in user_ids]
     if not external_ids:
         return None
 
-    payload = {
+    if not (ONESIGNAL_ENABLED and ONESIGNAL_APP_ID and ONESIGNAL_REST_API_KEY):
+        logger.warning("[OneSignal DISABLED] would send %r to %s", title, external_ids)
+        return None
+
+    payload: dict = {
         "app_id": ONESIGNAL_APP_ID,
-        "headings": {"en": title},
-        "contents": {"en": message},
+        "headings": {"en": title, "es": title},
+        "contents": {"en": message, "es": message},
         "target_channel": "push",
         "include_aliases": {"external_id": external_ids},
     }
+    if subtitle:
+        payload["subtitle"] = {"en": subtitle, "es": subtitle}
     if data:
-        payload["data"] = data
+        payload["custom_data"] = data   # ← new API name for the device payload
+        payload["data"] = data          # harmless duplicate, protects against both behaviors
+    if small_icon:
+        payload["small_icon"] = small_icon
+    if large_icon:
+        payload["large_icon"] = large_icon
+    if big_picture:
+        payload["big_picture"] = big_picture
+    if buttons:
+        payload["buttons"] = buttons
+    if android_group:
+        payload["android_group"] = android_group
+    if thread_id:
+        payload["thread_id"] = thread_id
+    if collapse_id:
+        payload["collapse_id"] = collapse_id
+    if name:
+        payload["name"] = name
+    if extra:
+        payload.update(extra)
 
     headers = {
-        "Authorization": ONESIGNAL_REST_API_KEY,
+        "Authorization": f"Key {ONESIGNAL_REST_API_KEY}",   # ← new API scheme
         "Content-Type": "application/json",
+        "Accept": "application/json",
     }
 
-    if not ONESIGNAL_ENABLED:
-        logger.info(
-            "[OneSignal DISABLED] Would send push: title=%r message=%r to=%s",
-            title, message, external_ids,
-        )
-        return None
-
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.post(ONESIGNAL_URL, json=payload, headers=headers)
-        if resp.status_code != 200:
-            # Don't leak OneSignal's 401 as a FastAPI 401 — that would
-            # confuse the client into thinking the user's auth failed.
-            logger.error(
-                "OneSignal error %s: %s", resp.status_code, resp.text
-            )
-            # Raise as a plain RuntimeError instead of HTTPException — the
-            # caller (a router) can decide whether to surface this to the
-            # user or just log it. Push failures shouldn't fail the API
-            # request that triggered them.
-            raise RuntimeError(
-                f"OneSignal Error ({resp.status_code}): {resp.text}"
-            )
-        return resp.json()
+        resp = await client.post(ONESIGNAL_URL, params={"c": "push"}, json=payload, headers=headers)
+    if resp.status_code >= 400:
+        logger.error("OneSignal error %s: %s", resp.status_code, resp.text)
+        raise RuntimeError(f"OneSignal Error ({resp.status_code}): {resp.text}")
+
+    result = resp.json()
+    logger.info("OneSignal ok: %s", result)   # shows recipients + invalid alias counts
+    return result
 
 
-async def notify_users(
-    user_ids: Iterable[str | UUID],
-    title: str,
-    message: str,
-    data: dict | None = None,
-) -> None:
-    """Best-effort push: logs and swallows errors so a notification
-    failure never fails the parent API request.
-
-    Use this from routers (tarea created, comment added, etc.).
-    """
+async def notify_users(user_ids, *, title, message, **kwargs) -> None:
     try:
-        await send_push_via_onesignal(user_ids, title, message, data)
+        await send_push_via_onesignal(user_ids, title=title, message=message, **kwargs)
     except Exception as exc:
         logger.warning("notify_users failed: %s", exc)

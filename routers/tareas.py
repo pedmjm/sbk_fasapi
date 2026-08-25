@@ -395,13 +395,34 @@ async def create_tarea(
     await _load_tarea_relations(db, tarea)
 
     # Best-effort push notification
-    user_ids = await _resolve_personal_users(db, p_ids)
-    if user_ids:
+        # Best-effort push (Personal.id IS the OneSignal external_id)
+    if p_ids:
+        _icon = {"Alta": "🔴", "Media": "🟡", "Baja": "🟢"}.get(prioridad, "•")
+        vence = f"\nVence: {fecha_limite.strftime('%d/%m/%Y')}" if fecha_limite else ""
+        asignador = getattr(current_user, "nombre", None) or current_user.email  # adjust field
+
+        extra = None
+        if prioridad == "Alta":
+            extra = {"priority": 10, "ios_interruption_level": "time-sensitive"}
+
         await notify_users(
-            user_ids,
+            p_ids,
             title="Nueva tarea asignada",
-            message=f"{titulo} — prioridad {prioridad}",
+            message=(
+                f"{_icon} {titulo}\n"
+                f"{cliente.nombre}{vence}\n"      # adjust if Cliente uses razon_social etc.
+                f"Asignada por {asignador}"
+            ),
+            subtitle=f"Prioridad {prioridad}",
             data={"tarea_id": str(tarea.id), "action": "tarea.created"},
+            small_icon="ic_stat_tarea",
+            large_icon="https://serbreka.com/wp-content/uploads/2025/07/cropped-Logo-SBK-Favicon-BB-1-152x79.png",
+            buttons=[{"id": "view", "text": "Ver tarea"}],
+            android_group="tareas",       # stack multiple tareas instead of spamming
+            thread_id="tareas",           # same grouping on iOS
+            collapse_id=f"tarea:{tarea.id}",
+            name="tarea.created",
+            extra=extra,
         )
 
     return Envelope(
