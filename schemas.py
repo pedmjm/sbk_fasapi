@@ -211,6 +211,8 @@ class HerramientaUpdate(BaseModel):
     serial: Optional[str] = None
     grupo: Optional[str] = None
     tipo: Optional[str] = None
+    stock_minimo: Optional[int] = None
+    stock_actual: Optional[int] = None
     combustible: Optional[str] = Field(None, max_length=100)
     estado: Optional[str] = Field(None, max_length=50)
 
