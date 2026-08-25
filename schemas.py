@@ -200,7 +200,10 @@ class HerramientaCreate(BaseModel):
     nombre: str = Field(..., max_length=255)
     marca: Optional[str] = Field(None, max_length=255)
     serial: Optional[str] = None
-    tipo: Optional[str] = None  # validated against enum in router
+    grupo: Optional[str] = None
+    tipo: Optional[str] = None
+    stock_minimo: Optional[int] = None
+    stock_actual: Optional[int] = None
     combustible: Optional[str] = Field("N/A", max_length=100)
     estado: Optional[str] = Field("Disponible", max_length=50)
 
