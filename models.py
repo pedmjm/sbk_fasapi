@@ -70,7 +70,6 @@ class TipoHerramienta(str, enum.Enum):
     ELECTRICO = "Eléctrico"
     LOGISTICO = "Logístico"
     MANUAL = "Manual"
-    NA = ""
 
 class GrupoHerramienta(str, enum.Enum):
     MECANICA_LIGERA = "Mecánica Ligera"
@@ -86,7 +85,6 @@ class GrupoHerramienta(str, enum.Enum):
     PINTURA_ACABADOS = "Pintura y Acabados"
     TUBERIAS = "Tuberías"
     TOPOGRAFIA_NIVELACION = "Topografía y Nivelación"
-    NA = ""
     # JARDINERIA_EXTERIORES = "Jardinería y Áreas Verdes"
 
 class TipoConsumible(str, enum.Enum):
@@ -98,8 +96,6 @@ class TipoConsumible(str, enum.Enum):
     PINTURA = "Pintura"
     TUBERIA = "Tubería"
     OTRO = "Otro"
-    NA = ""
-    
 
 
 class EstadoPickingItem(str, enum.Enum):
@@ -402,7 +398,6 @@ class Herramienta(Base):
     )
     grupo: Mapped[GrupoHerramienta] = mapped_column(
         Enum(GrupoHerramienta, name='grupo_herramienta'),
-        default="",
         nullable=True,
         )
     stock_actual: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
