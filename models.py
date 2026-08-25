@@ -70,6 +70,7 @@ class TipoHerramienta(str, enum.Enum):
     ELECTRICO = "Eléctrico"
     LOGISTICO = "Logístico"
     MANUAL = "Manual"
+    NA = ""
 
 class GrupoHerramienta(str, enum.Enum):
     MECANICA_LIGERA = "Mecánica Ligera"
@@ -85,6 +86,7 @@ class GrupoHerramienta(str, enum.Enum):
     PINTURA_ACABADOS = "Pintura y Acabados"
     TUBERIAS = "Tuberías"
     TOPOGRAFIA_NIVELACION = "Topografía y Nivelación"
+    NA = ""
     # JARDINERIA_EXTERIORES = "Jardinería y Áreas Verdes"
 
 class TipoConsumible(str, enum.Enum):
@@ -96,6 +98,8 @@ class TipoConsumible(str, enum.Enum):
     PINTURA = "Pintura"
     TUBERIA = "Tubería"
     OTRO = "Otro"
+    NA = ""
+    
 
 
 class EstadoPickingItem(str, enum.Enum):
