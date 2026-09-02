@@ -3,7 +3,8 @@ FastAPI app entry point. Wires together:
 
   * The lifespan that creates DB tables on first boot
   * All routers (auth, personal, herramientas, clientes, sucursales,
-    contactos, tareas, comentarios, notifications)
+    contactos, tareas, pasos, notifications, visitas, informes,
+    usuarios, perfil, chat)
   * The `/storage` static-file mount for uploaded images
   * A request-logging middleware that REDACTS the Authorization header
     and password fields (fixes the security issue in Laravel's
@@ -24,7 +25,12 @@ from fastapi.staticfiles import StaticFiles
 from database import create_db_and_tables
 from routers import (
     auth,
-    comentarios,
+    pasos,
+    visitas,
+    informes,
+    usuarios,
+    perfil,
+    chat,
     clientes,
     contactos,
     herramientas,
@@ -78,7 +84,12 @@ app.include_router(clientes.router)
 app.include_router(sucursales.router)
 app.include_router(contactos.router)
 app.include_router(tareas.router)
-app.include_router(comentarios.router)
+app.include_router(pasos.router)
+app.include_router(visitas.router)
+app.include_router(informes.router)
+app.include_router(usuarios.router)
+app.include_router(perfil.router)
+app.include_router(chat.router)
 app.include_router(notifications.router)
 app.include_router(consumibles.router)
 app.include_router(picking.router)

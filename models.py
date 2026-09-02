@@ -45,6 +45,7 @@ from sqlalchemy import (
     Text,
     func,
     Uuid,
+    JSON,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
@@ -116,6 +117,13 @@ class EstadoTarea(str, enum.Enum):
     PENDIENTE = "pendiente"
     EN_PROGRESO = "en_progreso"
     COMPLETADA = "completada"
+    CANCELADA = "cancelada"
+
+
+class EstadoVisita(str, enum.Enum):
+    PROGRAMADA = "programada"
+    EN_PROGRESO = "en_progreso"
+    FINALIZADA = "finalizada"
     CANCELADA = "cancelada"
 
 # ─── Association tables (M:N) ────────────────────────────────────────────────
@@ -235,6 +243,10 @@ class User(Base):
     foto_perfil: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     disabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Bumped to invalidate ALL of this user's outstanding JWTs (deactivate,
+    # password change). Tokens carry the version as the `ver` claim; a
+    # mismatch in `auth.get_current_user` → 401.
+    token_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -272,6 +284,11 @@ class Personal(Base):
     cargo: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     tipo_usuario: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     activo: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Mirror of the linked User's foto_perfil (User.id == Personal.id).
+    # Written through `POST /perfil/imagen` so the técnico's photo shows up
+    # wherever Personal is listed (tareas, visitas, picking, /tecnicos)
+    # without loading the User relation everywhere.
+    foto_perfil: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -679,16 +696,34 @@ class PasosTarea(Base):
     )
 
     tarea: Mapped[Tarea] = relationship(back_populates="pasos")
+    # Comments now live on each paso (step), not on the tarea itself.
+    comentarios: Mapped[list["Comentario"]] = relationship(
+        back_populates="paso",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="Comentario.created_at",
+    )
 
 
 class Comentario(Base):
-    """A comment on a Tarea. May contain text, image(s), or both."""
+    """A comment on a Tarea's Paso (step). May contain text, image(s), or both.
+
+    `tarea_id` is kept (denormalized from the paso's tarea) so cascade
+    deletes, notifications and cleanup can still query comments by tarea.
+    New comments are always created through a paso (`paso_id` is set by
+    the API; the column itself stays nullable for flexibility).
+    """
     __tablename__ = "comentarios"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     tarea_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("tareas.id", ondelete="CASCADE"),
         nullable=False,
+        index=True,
+    )
+    paso_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        ForeignKey("pasos_tarea.id", ondelete="CASCADE"),
+        nullable=True,
         index=True,
     )
     autor_id: Mapped[uuid.UUID] = mapped_column(
@@ -709,9 +744,10 @@ class Comentario(Base):
     )
 
     tarea: Mapped[Tarea] = relationship(back_populates="comentarios")
+    paso: Mapped[Optional[PasosTarea]] = relationship(back_populates="comentarios")
     autor: Mapped[User] = relationship(back_populates="comentarios")
     # NOTE: Imagen rows for this Comentario are loaded explicitly in
-    # `routers/comentarios.py` via a `select(Imagen).where(
+    # `routers/pasos.py` via a `select(Imagen).where(
     # Imagen.imageable_type=='Comentario', Imagen.imageable_id==str(c.id))`
     # and stashed on the instance as `comentario.imagenes_proxy`.
     # We do NOT define a polymorphic SQLAlchemy relationship here because
@@ -842,3 +878,209 @@ class TareaConsumibleEstado(Base):
     tarea: Mapped["Tarea"] = relationship()
     consumible: Mapped["Consumible"] = relationship()
     personal: Mapped[Optional["Personal"]] = relationship()
+
+
+# ─── Visitas + Informes Técnicos ────────────────────────────────────────────
+
+class Visita(Base):
+    """A scheduled technical visit to a client. Flow: programada →
+    finalizada (→ optional InformeTecnico). Mirrors the Flet app's
+    visitas views (cliente/técnico/fecha/ubicación/descripción, detalles
+    técnicos, incidencias, observaciones, evidencias fotográficas).
+    """
+    __tablename__ = "visitas"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    cliente_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("clientes.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sucursal_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        ForeignKey("sucursals.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    personal_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        ForeignKey("personals.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    creador_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    fecha: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ubicacion: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    descripcion: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    telefono_contacto: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    estado: Mapped[EstadoVisita] = mapped_column(
+        Enum(EstadoVisita, name="estado_visita"),
+        default=EstadoVisita.PROGRAMADA,
+        nullable=False,
+    )
+    # Free-form parameters evaluated during the visit, e.g.
+    # {"Voltaje de Línea (V)": "440", "Temperatura Operativa (°C)": "62"}
+    detalles_tecnicos: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    incidencias: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    observaciones: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    # Relationships
+    cliente: Mapped[Cliente] = relationship()
+    sucursal: Mapped[Optional[Sucursal]] = relationship()
+    personal: Mapped[Optional[Personal]] = relationship()
+    creador: Mapped[User] = relationship()
+    informe: Mapped[Optional["InformeTecnico"]] = relationship(
+        back_populates="visita",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        uselist=False,
+    )
+    # NOTE: Imagen rows for this Visita are loaded explicitly in
+    # `routers/visitas.py` (polymorphic `imageable_type == "Visita"`),
+    # same pattern as Tarea/Comentario.
+
+
+class InformeTecnico(Base):
+    """Technical report generated from a finalized Visita (1:1).
+
+    `id` is the real UUID PK; `number` is a human-friendly sequential
+    Integer (max+1, NO zero-padding — the client pads for display, e.g.
+    number=182 renders as "000182").
+
+    Columns are flat and prefixed by section; the API schema exposes them
+    nested exactly like the report JSON template:
+      gen_*    → general_information
+      eq_*     → identificacion_del_equipo
+      cond_*   → condiciones_del_equipo
+      pr_*     → pruebas_electricas (incl. megger mediciones + valores
+                 de disparo)
+    """
+    __tablename__ = "informes_tecnicos"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    visita_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("visitas.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    number: Mapped[int] = mapped_column(Integer, unique=True, nullable=False)
+
+    # ── Top-level ──
+    titulo: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    fecha_de_emision: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    orden_de_compra: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    lugar: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # ── general_information (gen_*) ──
+    gen_cliente: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    gen_atencion: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    gen_fecha_de_ejecucion: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    gen_garantia: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
+    # ── identificacion_del_equipo (eq_*) ──
+    eq_equipo: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    eq_marca: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    eq_voltaje: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    eq_modelo: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    eq_tipo: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    eq_corriente: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    eq_unidad_de_disparo: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    eq_alimenta: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    eq_categoria: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
+    # ── condiciones_del_equipo (cond_*) ──
+    cond_camaras_de_extincion_de_arco: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    cond_mecanismo_de_apertura_y_cierre: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    cond_conexiones_de_entrada_y_salida: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    cond_frame_base: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    cond_celda: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    cond_contactos_fijos: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    cond_pruebas_de_accionamiento_mecanico: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    cond_leva_de_disparo: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    cond_frame_tapa: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    cond_barras: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    cond_contactos_moviles: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    cond_cuchillas_secundarias: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    cond_tornilleria_en_general: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    cond_accesorios: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    cond_cables: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+
+    # ── pruebas_electricas (pr_*): megger test ──
+    pr_voltaje_vdc: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    pr_a_vs_b: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    pr_b_vs_c: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    pr_c_vs_a: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    pr_abc_vs_tierra: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    pr_entrada_vs_salida: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    pr_salida_vs_entrada: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
+    # ── pruebas_electricas (pr_*): disparo ──
+    pr_unidad_de_disparo_tipo: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    pr_tipo_de_prueba: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    pr_valor_teorico_long_delay: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    pr_valor_dejado: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    pr_simulacion_disparo_corto: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    pr_tierra_ground: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
+    # ── Cierres ──
+    observaciones: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    recomendaciones: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    # Relationships
+    visita: Mapped[Visita] = relationship(back_populates="informe")
+
+
+# ─── Chat por tarea ─────────────────────────────────────────────────────────
+
+class MensajeChat(Base):
+    """A single chat message inside a Tarea's chat room.
+
+    Delivered in real time via the WebSocket endpoint
+    `/ws/tareas/{tarea_id}` (see `routers/chat.py`); this table is the
+    persistent history. Participants (creador + users linked to the
+    assigned Personal) write; spectators only read.
+    """
+    __tablename__ = "chat_mensajes"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    tarea_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tareas.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    autor_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    contenido: Mapped[str] = mapped_column(Text, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    autor: Mapped[User] = relationship()

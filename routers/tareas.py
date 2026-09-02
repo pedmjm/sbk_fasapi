@@ -12,13 +12,14 @@ Tareas (tasks) CRUD router — the core of the app. Mirrors Laravel's
 Endpoints (all under `/tareas`, all require auth):
   GET    /tareas                  list all tareas (with relations)
   POST   /tareas                  create a tarea (multipart/form-data)
-  GET    /tareas/{tarea_id}       full detail (relations + comments)
+  GET    /tareas/{tarea_id}       full detail (relations + pasos with comments)
   PUT    /tareas/{tarea_id}       update (sync personal/herramientas)
   DELETE /tareas/{tarea_id}       delete + cleanup files
-  POST   /tareas/{tarea_id}/pasos          add a step
-  PUT    /tareas/{tarea_id}/pasos/{paso_id}  update a step (toggle completado, etc.)
-  DELETE /tareas/{tarea_id}/pasos/{paso_id}  remove a step
   POST   /tareas/{tarea_id}/imagenes        attach evidence photos
+
+Paso CRUD + paso comments live in `routers/pasos.py`
+(`/pasos/{tarea_id}/{paso_id}...`) — comments belong to each paso, and are
+nested under `pasos[].comentarios` in this router's responses.
 
 Notifications: when a tarea is created with assigned `personal_ids`, a
 push is sent to every User whose `cedula` matches one of those Personals.
@@ -43,8 +44,9 @@ from fastapi import (
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import set_committed_value
 
-from auth import get_current_active_user
+from auth import get_current_active_user, require_nivel
 from database import get_db
 from models import (
     Cliente,
@@ -68,9 +70,6 @@ from notifications import notify_users
 from schemas import (
     Envelope,
     ImagenOut,
-    PasoCreate,
-    PasoOut,
-    PasoUpdate,
     TareaCreate,
     TareaNested,
     TareaUpdate,
@@ -125,6 +124,18 @@ async def _load_tarea_relations(db: AsyncSession, tarea: Tarea) -> None:
 
 def _serialize_tarea(tarea: Tarea) -> TareaNested:
     """Build the nested response, attaching the polymorphic images."""
+    # Bind each paso's comentarios in memory (grouped from tarea.comentarios)
+    # via set_committed_value: Pydantic validation then reads an already-set
+    # attribute instead of triggering a lazy load (which would crash in
+    # async context), and the ORM doesn't record the change as dirty.
+    comentarios_by_paso: dict[uuid.UUID, list[Comentario]] = {}
+    for c in tarea.comentarios:
+        if c.paso_id is not None:
+            comentarios_by_paso.setdefault(c.paso_id, []).append(c)
+    for p in tarea.pasos:
+        cs = sorted(comentarios_by_paso.get(p.id, []), key=lambda c: c.created_at)
+        set_committed_value(p, "comentarios", cs)
+
     data = TareaNested.model_validate(tarea).model_dump()
     # Replace the empty `imagenes` list (the relationship isn't auto-loaded
     # for Tarea because we don't have a SQLAlchemy `relationship()` on it)
@@ -133,12 +144,13 @@ def _serialize_tarea(tarea: Tarea) -> TareaNested:
     data["imagenes"] = [
         ImagenOut.model_validate(img).model_dump() for img in tarea_imgs
     ]
-    # Also patch comentarios' imagenes the same way.
-    for c_data, c_obj in zip(data["comentarios"], tarea.comentarios):
-        c_imgs = getattr(c_obj, "imagenes_proxy", [])
-        c_data["imagenes"] = [
-            ImagenOut.model_validate(img).model_dump() for img in c_imgs
-        ]
+    # Attach each comentario's polymorphic imagenes, now nested per paso.
+    for p_data, p_obj in zip(data["pasos"], tarea.pasos):
+        for c_data, c_obj in zip(p_data["comentarios"], p_obj.comentarios):
+            c_data["imagenes"] = [
+                ImagenOut.model_validate(img).model_dump(mode="json")
+                for img in getattr(c_obj, "imagenes_proxy", [])
+            ]
     return TareaNested(**data)
 
 
@@ -410,7 +422,7 @@ async def create_tarea(
             title="Nueva tarea asignada",
             message=(
                 f"{_icon} {titulo}\n"
-                f"{cliente.nombre}{vence}\n"      # adjust if Cliente uses razon_social etc.
+                f"{cliente.razon_social or cliente.nombre_comercial or ''}{vence}\n"
                 f"Asignada por {asignador}"
             ),
             subtitle=f"Prioridad {prioridad}",
@@ -676,66 +688,9 @@ async def delete_tarea(
     return Envelope(message="Tarea eliminada correctamente")
 
 
-# ─── Pasos sub-resource ─────────────────────────────────────────────────────
-
-@router.post("/{tarea_id}/pasos", response_model=Envelope, status_code=status.HTTP_201_CREATED)
-async def add_paso(
-    tarea_id: uuid.UUID,
-    body: PasoCreate,
-    db: Annotated[AsyncSession, Depends(get_db)],
-    _current_user: Annotated[User, Depends(get_current_active_user)],
-):
-    tarea = (
-        await db.execute(select(Tarea).where(Tarea.id == tarea_id))
-    ).scalar_one_or_none()
-    if not tarea:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tarea no encontrada")
-    paso = PasosTarea(tarea_id=tarea_id, **body.model_dump())
-    db.add(paso)
-    await db.commit()
-    await db.refresh(paso)
-    return Envelope(message="Paso agregado", data=PasoOut.model_validate(paso))
-
-
-@router.put("/{tarea_id}/pasos/{paso_id}", response_model=Envelope)
-async def update_paso(
-    tarea_id: uuid.UUID,
-    paso_id: uuid.UUID,
-    body: PasoUpdate,
-    db: Annotated[AsyncSession, Depends(get_db)],
-    _current_user: Annotated[User, Depends(get_current_active_user)],
-):
-    paso = (
-        await db.execute(
-            select(PasosTarea).where(PasosTarea.id == paso_id, PasosTarea.tarea_id == tarea_id)
-        )
-    ).scalar_one_or_none()
-    if not paso:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Paso no encontrado")
-    for k, v in body.model_dump(exclude_unset=True).items():
-        setattr(paso, k, v)
-    await db.commit()
-    await db.refresh(paso)
-    return Envelope(message="Paso actualizado", data=PasoOut.model_validate(paso))
-
-
-@router.delete("/{tarea_id}/pasos/{paso_id}", response_model=Envelope)
-async def delete_paso(
-    tarea_id: uuid.UUID,
-    paso_id: uuid.UUID,
-    db: Annotated[AsyncSession, Depends(get_db)],
-    _current_user: Annotated[User, Depends(get_current_active_user)],
-):
-    paso = (
-        await db.execute(
-            select(PasosTarea).where(PasosTarea.id == paso_id, PasosTarea.tarea_id == tarea_id)
-        )
-    ).scalar_one_or_none()
-    if not paso:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Paso no encontrado")
-    await db.delete(paso)
-    await db.commit()
-    return Envelope(message="Paso eliminado")
+# ─── Pasos sub-resource: moved to routers/pasos.py ─────────────────────────
+# (POST /pasos/{tarea_id}, GET/PUT/DELETE /pasos/{tarea_id}/{paso_id},
+#  and paso comments under /pasos/{tarea_id}/{paso_id}/comentarios)
 
 
 # ─── Evidence image upload ─────────────────────────────────────────────────

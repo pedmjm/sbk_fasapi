@@ -6,8 +6,8 @@ function, async httpx client, 502-on-non-200 error wrapping) and adds:
 
   * `notify_users(user_ids, title, message, data)` — fan-out helper that
     batches multiple external_ids into a single OneSignal call. Used by
-    `routers/tareas.py` and `routers/comentarios.py` to push notifications
-    when a task is created or a comment is added.
+    `routers/tareas.py` and `routers/pasos.py` to push notifications
+    when a task is created or a paso comment is added.
   * `ONESIGNAL_ENABLED` toggle: when set to "0" (the default in local dev)
     the function logs the payload but does NOT call OneSignal, so you can
     develop without hitting the API.

@@ -96,6 +96,14 @@ async def get_current_user(
     user = result.scalar_one_or_none()
     if user is None:
         raise credentials_exception
+
+    # Token-version check: bumping `User.token_version` (deactivation,
+    # password change) instantly invalidates every outstanding JWT of that
+    # user. Tokens minted before the `ver` claim existed count as version 0.
+    token_ver = payload.get("ver", 0)
+    if not isinstance(token_ver, int) or token_ver != user.token_version:
+        raise credentials_exception
+
     return user
 
 

@@ -91,7 +91,9 @@ async def register(
     await db.commit()
     await db.refresh(user)
 
-    access_token = create_access_token(data={"sub": str(user.id)})
+    access_token = create_access_token(
+        data={"sub": str(user.id), "ver": user.token_version}
+    )
     return Token(
         access_token=access_token,
         user=UserOut.model_validate(user),
@@ -123,7 +125,9 @@ async def login(
             detail="Inactive user",
         )
 
-    access_token = create_access_token(data={"sub": str(user.id)})
+    access_token = create_access_token(
+        data={"sub": str(user.id), "ver": user.token_version}
+    )
     return Token(
         access_token=access_token,
         user=UserOut.model_validate(user),
@@ -153,7 +157,9 @@ async def login_json(
             detail="Inactive user",
         )
 
-    access_token = create_access_token(data={"sub": str(user.id)})
+    access_token = create_access_token(
+        data={"sub": str(user.id), "ver": user.token_version}
+    )
     return Token(
         access_token=access_token,
         user=UserOut.model_validate(user),

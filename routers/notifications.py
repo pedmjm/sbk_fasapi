@@ -4,7 +4,7 @@ template's `POST /notifications/send` route, plus a `/test/{id}` route
 for quick sanity checks.
 
 Automatic notifications are also fired from `routers/tareas.py` (on task
-creation) and `routers/comentarios.py` (on comment creation) — this
+creation) and `routers/pasos.py` (on paso comment creation) — this
 router is for ad-hoc / manual pushes.
 """
 from __future__ import annotations
