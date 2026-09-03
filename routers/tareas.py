@@ -53,6 +53,7 @@ from models import (
     Comentario,
     Herramienta,
     Imagen,
+    MensajeChat,
     PasosTarea,
     Personal,
     Prioridad,
@@ -66,6 +67,7 @@ from models import (
     tarea_consumible,
     EstadoTarea,
 )
+from routers.pasos import _delete_imagen_row
 from notifications import notify_users
 from schemas import (
     Envelope,
@@ -513,10 +515,23 @@ async def update_tarea(
     if not tarea:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tarea no encontrada")
 
-    if tarea.estado in ("en_progreso", "completada", "cancelada"):
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Tarea previamente iniciada")
-
     data = body.model_dump(exclude_unset=True)
+
+    if tarea.estado in (EstadoTarea.COMPLETADA, EstadoTarea.CANCELADA):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Tarea completada/cancelada no editable",
+        )
+
+    # ✅ En progreso SOLO se permite reasignar el personal (the GUI's
+    # PersonalPicker does a full PUT with just personal_ids).
+    if tarea.estado == EstadoTarea.EN_PROGRESO:
+        otros = [k for k in data if k != "personal_ids"]
+        if otros:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Tarea en progreso: solo se puede modificar el personal asignado",
+            )
 
     # Validate prioridad if present.
     if "prioridad" in data and data["prioridad"] is not None:
@@ -676,9 +691,27 @@ async def delete_tarea(
             )
         ).scalars().all()
         for img in c_imgs:
-            delete_rel_path(img.path)
-            await db.delete(img)
+            await _delete_imagen_row(db, img)
         delete_subdir("comentarios", str(c.id))
+
+    # 1b. Chat messages' images (polymorphic 'ChatMensaje', files under
+    #     storage/chat/{mensaje_id}/). Compartidas con copias en comentarios:
+    #     el borrado seguro solo elimina el archivo si nadie más lo usa.
+    chat_msg_ids = (
+        await db.execute(select(MensajeChat.id).where(MensajeChat.tarea_id == tarea_id))
+    ).scalars().all()
+    for mid in chat_msg_ids:
+        m_imgs = (
+            await db.execute(
+                select(Imagen).where(
+                    Imagen.imageable_type == "ChatMensaje",
+                    Imagen.imageable_id == str(mid),
+                )
+            )
+        ).scalars().all()
+        for img in m_imgs:
+            await _delete_imagen_row(db, img)
+        delete_subdir("chat", str(mid))
 
     delete_subdir("tareas", str(tarea_id))
 

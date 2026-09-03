@@ -67,8 +67,29 @@ from storage_helpers import (
     delete_subdir,
     save_upload,
 )
+import json
 
 router = APIRouter(tags=["pasos"])
+
+
+def _puede_gestionar_pasos(tarea: Tarea, user: User) -> bool:
+    """Agregar/quitar pasos (incluso con la tarea en progreso): solo el
+    creador de la tarea o un admin (nivel >= 2)."""
+    return tarea.creador_id == user.id or user.nivel >= 2
+
+
+async def _delete_imagen_row(db: AsyncSession, img: Imagen) -> None:
+    """Delete an Imagen row; only unlink the physical file when no OTHER
+    row shares the same path (paths can be shared: chat→comentario copies,
+    foto de perfil espejo)."""
+    otra = (
+        await db.execute(
+            select(Imagen).where(Imagen.path == img.path, Imagen.id != img.id)
+        )
+    ).first()
+    if not otra:
+        delete_rel_path(img.path)
+    await db.delete(img)
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -139,6 +160,11 @@ async def add_paso(
     ).scalar_one_or_none()
     if not tarea:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tarea no encontrada")
+    if not _puede_gestionar_pasos(tarea, _current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo el creador de la tarea (o un admin) puede agregar pasos.",
+        )
 
     paso = PasosTarea(tarea_id=tarea_id, **body.model_dump())
     db.add(paso)
@@ -210,9 +236,16 @@ async def delete_paso(
     paso = await _fetch_paso(db, tarea_id, paso_id)
     if not paso:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Paso no encontrado")
+    if not _puede_gestionar_pasos(paso.tarea, _current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo el creador de la tarea (o un admin) puede eliminar pasos.",
+        )
 
     # Comments live on the paso now: delete their Imagen rows + physical
     # files before the cascade removes the rows (otherwise they orphan).
+    # Shared paths (copiadas de mensajes de chat) solo se borran del disco
+    # si ninguna otra fila las referencia.
     for c in paso.comentarios:
         c_imgs = (
             await db.execute(
@@ -223,8 +256,7 @@ async def delete_paso(
             )
         ).scalars().all()
         for img in c_imgs:
-            delete_rel_path(img.path)
-            await db.delete(img)
+            await _delete_imagen_row(db, img)
         delete_subdir("comentarios", str(c.id))
 
     await db.delete(paso)
@@ -273,16 +305,33 @@ async def create_comentario(
     current_user: Annotated[User, Depends(get_current_active_user)],
     texto: Optional[str] = Form(default=None),
     imagenes: list[UploadFile] = File(default=[]),
+    imagen_ids: Optional[str] = Form(
+        default=None,
+        description="JSON lista de ids de Imagen existentes (p.ej. de un mensaje "
+                    "de chat) para adjuntarlas SIN duplicar el archivo físico.",
+    ),
 ):
     clean_texto = texto.strip() if texto and texto.strip() else None
 
     # Filter invalid empty fields
     valid_images = [f for f in imagenes if f.filename]
 
-    if not clean_texto and not valid_images:
+    # Optional: reuse existing Imagen rows (chat → comentario copy).
+    reused_ids: list[int] = []
+    if imagen_ids:
+        try:
+            parsed = json.loads(imagen_ids)
+            reused_ids = [int(i) for i in parsed]
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"imagen_ids no es una lista JSON válida de ids: {exc}",
+            )
+
+    if not clean_texto and not valid_images and not reused_ids:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Debes enviar al menos un texto o una imagen.",
+            detail="Debes enviar al menos un texto, una imagen o imagen_ids.",
         )
 
     paso = await _fetch_paso(db, tarea_id, paso_id)
@@ -326,6 +375,27 @@ async def create_comentario(
         )
         db.add(img)
         saved_images.append(img)
+
+    # ─── Reused images (chat → comentario): new Imagen rows pointing at
+    # the SAME physical file — no duplication on disk.
+    if reused_ids:
+        origenes = (
+            await db.execute(select(Imagen).where(Imagen.id.in_(reused_ids)))
+        ).scalars().all()
+        if len(origenes) != len(set(reused_ids)):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Uno o más imagen_ids no existen.",
+            )
+        for orig in origenes:
+            img = Imagen(
+                path=orig.path,
+                url=orig.url,
+                imageable_type="Comentario",
+                imageable_id=str(comentario.id),
+            )
+            db.add(img)
+            saved_images.append(img)
 
     await db.commit()
     await db.refresh(comentario)
@@ -388,7 +458,8 @@ async def delete_comentario(
             detail="No autorizado para eliminar este comentario.",
         )
 
-    # 1. Delete physical files + Imagen rows.
+    # 1. Delete Imagen rows + physical files — pero solo del disco si
+    #    ninguna otra fila comparte el path (copias desde chat).
     imgs = (
         await db.execute(
             select(Imagen).where(
@@ -398,8 +469,7 @@ async def delete_comentario(
         )
     ).scalars().all()
     for img in imgs:
-        delete_rel_path(img.path)
-        await db.delete(img)
+        await _delete_imagen_row(db, img)
     delete_subdir("comentarios", str(comentario_id))
 
     # 2. Delete the comentario row.

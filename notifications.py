@@ -28,7 +28,9 @@ ONESIGNAL_REST_API_KEY = os.getenv("ONESIGNAL_REST_API_KEY", "api-key")
 ONESIGNAL_URL = "https://api.onesignal.com/notifications"
 # When disabled, payloads are logged but NOT sent. Defaults to disabled
 # so local dev doesn't need real OneSignal credentials.
-ONESIGNAL_ENABLED = os.getenv("ONESIGNAL_ENABLED", "0")
+# NOTE: parsed as a real boolean — the old `os.getenv(...)` treated the
+# string "0" as ENABLED (any non-empty string is truthy).
+ONESIGNAL_ENABLED = os.getenv("ONESIGNAL_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 

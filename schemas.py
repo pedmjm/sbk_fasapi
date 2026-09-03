@@ -795,5 +795,10 @@ class MensajeChatOut(BaseModel):
     contenido: str
     created_at: datetime
     autor: Optional[UserOut] = None
+    # Polymorphic images (imageable_type='ChatMensaje'); files under
+    # storage/chat/{mensaje_id}/. Attached by the chat serializer.
+    imagenes: list[ImagenOut] = Field(default_factory=list)
+    # Deterministic bubble color: PALETA[autor_id.int % len(PALETA)].
+    color: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)

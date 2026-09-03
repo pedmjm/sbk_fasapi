@@ -23,6 +23,7 @@ from fastapi import (
     UploadFile,
     status,
 )
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import (
@@ -32,7 +33,7 @@ from auth import (
     verify_password,
 )
 from database import get_db
-from models import User
+from models import Personal, User
 from schemas import (
     Envelope,
     PasswordChange,
@@ -112,11 +113,23 @@ async def upload_foto_perfil(
             detail=str(exc),
         )
 
-    # Replace: remove the previous photo file (if any).
+    # Replace: remove the previous photo file (if any) — only when no other
+    # row still points at it (the path is shared with personals.foto_perfil
+    # and possibly comment/chat image copies).
     if current_user.foto_perfil:
         delete_rel_path(current_user.foto_perfil)
 
     current_user.foto_perfil = rel
+
+    # ─── Write-through: mirror onto the linked Personal (User.id ==
+    # Personal.id) so the técnico's photo shows in /tecnicos, tareas,
+    # visitas y picking sin cargar la relación User en cada query.
+    personal = (
+        await db.execute(select(Personal).where(Personal.id == current_user.id))
+    ).scalar_one_or_none()
+    if personal:
+        personal.foto_perfil = rel
+
     await db.commit()
     await db.refresh(current_user)
 

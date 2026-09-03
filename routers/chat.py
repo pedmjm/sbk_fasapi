@@ -1,5 +1,5 @@
 """
-Chat por tarea — WebSocket en tiempo real + historial REST.
+Chat por tarea — WebSocket en tiempo real + REST (historial e imágenes).
 
 Cada tarea tiene su propia sala. Roles:
   * **Participante**: el creador de la tarea y los usuarios vinculados al
@@ -8,32 +8,51 @@ Cada tarea tiene su propia sala. Roles:
     (recibe historial y broadcast), no puede escribir y NUNCA recibe
     notificaciones push.
 
-Notificaciones: cada mensaje dispara un push OneSignal a los
-**participantes que NO están conectados a la sala en ese momento**
-(exceptuando al autor). Los espectadores no reciben push.
+Colores de burbuja: cada mensaje serializado incluye `color`, calculado
+determinísticamente como PALETA_COLORES[autor_id.int % 8] — la misma
+paleta en servidor y clientes (ver docs/ACTUALIZACION_CHAT_UI.md).
+
+Imágenes: los mensajes pueden llevar imágenes (polimórficas,
+`imageable_type='ChatMensaje'`, archivos en `storage/chat/{mensaje_id}/`).
+Por WebSocket solo se envía texto; los mensajes con imágenes van por
+REST `POST /tareas/{tarea_id}/mensajes/imagenes`, que hace broadcast a
+la sala con el mismo payload (incluyendo `imagenes`) y notifica vía
+OneSignal a los participantes NO conectados.
 
 Endpoints:
-  WS  /ws/tareas/{tarea_id}?token=JWT     sala de chat en tiempo real
-  GET /tareas/{tarea_id}/mensajes         historial (?limite=100)
+  WS   /ws/tareas/{tarea_id}?token=JWT        sala en tiempo real (texto)
+  GET  /tareas/{tarea_id}/mensajes            historial (?limite=100)
+  POST /tareas/{tarea_id}/mensajes/imagenes   mensaje con imágenes (multipart)
 
 Protocolo WS (JSON):
   server → cliente:
     {"type": "historial", "mensajes": [...]}          al conectar
     {"type": "usuario_conectado", "user_id", "name", "rol"}
     {"type": "usuario_desconectado", "user_id", "name"}
-    {"type": "mensaje", "id", "tarea_id", "autor": {...},
-     "contenido", "created_at"}
+    {"type": "mensaje", "id", "tarea_id", "autor": {...}, "contenido",
+     "imagenes": [...], "color": "#E3F2FD", "created_at"}
     {"type": "error", "detail": "..."}
   cliente → server:
-    {"type": "mensaje", "contenido": "texto"}
+    {"type": "mensaje", "contenido": "texto"}   (imágenes → endpoint REST)
 """
 from __future__ import annotations
 
 import uuid
-from typing import Annotated, Optional
+from typing import Annotated, Iterable, Optional
 
 import jwt as pyjwt
-from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from jwt.exceptions import InvalidTokenError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,21 +60,74 @@ from sqlalchemy.orm import selectinload
 
 from auth import ALGORITHM, SECRET_KEY, get_current_active_user
 from database import async_session, get_db
-from models import MensajeChat, Personal, Tarea, User
+from models import Imagen, MensajeChat, Personal, Tarea, User
 from notifications import notify_users
-from schemas import Envelope, MensajeChatOut, UserOut
+from schemas import Envelope, ImagenOut, MensajeChatOut, UserOut
+from storage_helpers import build_public_url, save_upload
 
 router = APIRouter(tags=["chat"])
 
 HISTORIAL_DEFAULT = 100
 
+# Paleta de burbujas (8 tonos suaves) — compartida con la UI.
+# Color = PALETA_COLORES[autor_id.int % len(PALETA_COLORES)].
+PALETA_COLORES = [
+    "#E3F2FD",  # azul claro
+    "#F3E5F5",  # lila claro
+    "#E8F5E9",  # verde claro
+    "#FFF8E1",  # ámbar claro
+    "#FFEBEE",  # rojo claro
+    "#E0F7FA",  # cian claro
+    "#F1F8E9",  # verde lima claro
+    "#EDE7F6",  # lavanda claro
+]
+
+
+def color_de_autor(autor_id) -> str:
+    return PALETA_COLORES[uuid.UUID(str(autor_id)).int % len(PALETA_COLORES)]
+
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
-def _serialize_mensaje(m: MensajeChat) -> dict:
+def _serialize_mensaje(m: MensajeChat, imagenes: Optional[Iterable[Imagen]] = None) -> dict:
     data = MensajeChatOut.model_validate(m).model_dump(mode="json")
     data["autor"] = UserOut.model_validate(m.autor).model_dump(mode="json")
+    imgs = imagenes if imagenes is not None else getattr(m, "imagenes_proxy", [])
+    data["imagenes"] = [
+        ImagenOut.model_validate(img).model_dump(mode="json") for img in imgs
+    ]
+    data["color"] = color_de_autor(m.autor_id)
     return data
+
+
+async def _load_mensajes_imagenes(db: AsyncSession, mensajes: list[MensajeChat]) -> None:
+    """Batch-load the polymorphic Imagen rows for a list of messages and
+    stash them on each instance as `imagenes_proxy`."""
+    ids = [str(m.id) for m in mensajes]
+    if not ids:
+        return
+    rows = (
+        await db.execute(
+            select(Imagen)
+            .where(Imagen.imageable_type == "ChatMensaje", Imagen.imageable_id.in_(ids))
+            .order_by(Imagen.created_at)
+        )
+    ).scalars().all()
+    by_mensaje: dict[str, list[Imagen]] = {}
+    for img in rows:
+        by_mensaje.setdefault(img.imageable_id, []).append(img)
+    for m in mensajes:
+        m.imagenes_proxy = by_mensaje.get(str(m.id), [])  # type: ignore[attr-defined]
+
+
+async def _fetch_tarea(db: AsyncSession, tarea_id: uuid.UUID) -> Optional[Tarea]:
+    return (
+        await db.execute(
+            select(Tarea)
+            .options(selectinload(Tarea.personal))
+            .where(Tarea.id == tarea_id)
+        )
+    ).scalar_one_or_none()
 
 
 async def _participantes_de_tarea(tarea: Tarea) -> set[uuid.UUID]:
@@ -70,6 +142,40 @@ async def _participantes_de_tarea(tarea: Tarea) -> set[uuid.UUID]:
             ).scalars().all()
             ids.update(u.id for u in users)
     return ids
+
+
+async def _broadcast_y_notificar(
+    tarea: Tarea,
+    participantes: set[uuid.UUID],
+    autor: User,
+    payload: dict,
+    preview: str,
+) -> None:
+    """Broadcast a toda la sala + OneSignal a participantes desconectados
+    (sin el autor). Espectadores nunca reciben push."""
+    payload = dict(payload)
+    payload["type"] = "mensaje"
+    await manager.broadcast(tarea.id, payload)
+
+    conectados = manager.connected_participant_ids(tarea.id)
+    destinatarios = {
+        uid for uid in participantes
+        if uid not in conectados and uid != autor.id
+    }
+    if destinatarios:
+        await notify_users(
+            destinatarios,
+            title=f"Chat: {tarea.titulo}",
+            message=f"{autor.name}: {preview[:80]}",
+            data={
+                "tarea_id": str(tarea.id),
+                "mensaje_id": payload.get("id"),
+                "action": "chat.message",
+            },
+            android_group=f"chat:{tarea.id}",
+            thread_id=f"chat:{tarea.id}",
+            name="chat.message",
+        )
 
 
 async def _auth_ws_user(token: Optional[str]) -> Optional[User]:
@@ -163,11 +269,9 @@ async def list_mensajes(
     _current_user: Annotated[User, Depends(get_current_active_user)],
     limite: int = Query(HISTORIAL_DEFAULT, ge=1, le=500),
 ):
-    """Historial del chat de la tarea (asc). Los espectadores también
-    pueden leerlo."""
-    tarea = (
-        await db.execute(select(Tarea).where(Tarea.id == tarea_id))
-    ).scalar_one_or_none()
+    """Historial del chat de la tarea (asc, con imagenes y color).
+    Los espectadores también pueden leerlo."""
+    tarea = await _fetch_tarea(db, tarea_id)
     if not tarea:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tarea no encontrada")
 
@@ -180,8 +284,85 @@ async def list_mensajes(
             .limit(limite)
         )
     ).scalars().all()
-    # Últimos N en orden ascendente.
-    return Envelope(data=[_serialize_mensaje(m) for m in reversed(mensajes)])
+    mensajes = list(reversed(mensajes))
+    await _load_mensajes_imagenes(db, mensajes)
+    return Envelope(data=[_serialize_mensaje(m) for m in mensajes])
+
+
+# ─── REST: mensaje con imágenes ─────────────────────────────────────────────
+
+@router.post(
+    "/tareas/{tarea_id}/mensajes/imagenes",
+    response_model=Envelope,
+    status_code=status.HTTP_201_CREATED,
+)
+async def enviar_mensaje_con_imagenes(
+    tarea_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    texto: Optional[str] = Form(default=None),
+    imagenes: list[UploadFile] = File(default=[]),
+):
+    """Mensaje con imágenes (multipart `texto` + `imagenes[]`).
+
+    Solo participantes (mismo rol-check que el WS). Persiste el mensaje
+    (contenido puede ser vacío si hay imágenes), guarda los archivos en
+    `storage/chat/{mensaje_id}/`, crea filas `imagenes`
+    (imageable_type='ChatMensaje'), hace **broadcast** a la sala con el
+    mismo payload de `mensaje` (con `imagenes`) y notifica vía OneSignal
+    a los participantes NO conectados.
+    """
+    clean_texto = texto.strip() if texto and texto.strip() else None
+    valid_images = [f for f in imagenes if f.filename]
+    if not clean_texto and not valid_images:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Debes enviar al menos un texto o una imagen.",
+        )
+
+    tarea = await _fetch_tarea(db, tarea_id)
+    if not tarea:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tarea no encontrada")
+
+    participantes = await _participantes_de_tarea(tarea)
+    if current_user.id not in participantes:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo el creador y el personal asignado pueden escribir en este chat.",
+        )
+
+    m = MensajeChat(
+        tarea_id=tarea_id,
+        autor_id=current_user.id,
+        contenido=clean_texto or "",
+    )
+    db.add(m)
+    await db.flush()
+
+    saved: list[Imagen] = []
+    for f in valid_images:
+        try:
+            rel = await save_upload(f, "chat", str(m.id))
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        img = Imagen(
+            path=rel,
+            url=build_public_url(rel),
+            imageable_type="ChatMensaje",
+            imageable_id=str(m.id),
+        )
+        db.add(img)
+        saved.append(img)
+
+    await db.commit()
+    await db.refresh(m, attribute_names=["autor"])
+
+    payload = _serialize_mensaje(m, saved)
+    await _broadcast_y_notificar(
+        tarea, participantes, current_user, payload,
+        preview=clean_texto or "(imagen)",
+    )
+    return Envelope(message="Mensaje enviado", data=payload)
 
 
 # ─── WebSocket: sala por tarea ──────────────────────────────────────────────
@@ -195,13 +376,7 @@ async def chat_tarea_ws(ws: WebSocket, tarea_id: uuid.UUID):
         return
 
     async with async_session() as db:
-        tarea = (
-            await db.execute(
-                select(Tarea)
-                .options(selectinload(Tarea.personal))
-                .where(Tarea.id == tarea_id)
-            )
-        ).scalar_one_or_none()
+        tarea = await _fetch_tarea(db, tarea_id)
     if tarea is None:
         await ws.close(code=4404)  # tarea no encontrada
         return
@@ -211,7 +386,7 @@ async def chat_tarea_ws(ws: WebSocket, tarea_id: uuid.UUID):
 
     await manager.connect(tarea_id, user, ws, rol)
 
-    # 1. Historial inicial al que entra.
+    # 1. Historial inicial (con imagenes y color) al que entra.
     async with async_session() as db:
         mensajes = (
             await db.execute(
@@ -222,10 +397,12 @@ async def chat_tarea_ws(ws: WebSocket, tarea_id: uuid.UUID):
                 .limit(HISTORIAL_DEFAULT)
             )
         ).scalars().all()
+        mensajes = list(reversed(mensajes))
+        await _load_mensajes_imagenes(db, mensajes)
     await ws.send_json({
         "type": "historial",
         "rol": rol,
-        "mensajes": [_serialize_mensaje(m) for m in reversed(mensajes)],
+        "mensajes": [_serialize_mensaje(m) for m in mensajes],
     })
 
     # 2. Avisar a la sala.
@@ -262,43 +439,16 @@ async def chat_tarea_ws(ws: WebSocket, tarea_id: uuid.UUID):
                 })
                 continue
 
-            # 3. Persistir.
+            # 3. Persistir + broadcast + notificar (sin imágenes: para
+            #    mensajes con imágenes usar el endpoint REST).
             async with async_session() as db:
-                m = MensajeChat(
-                    tarea_id=tarea_id,
-                    autor_id=user.id,
-                    contenido=contenido,
-                )
+                m = MensajeChat(tarea_id=tarea_id, autor_id=user.id, contenido=contenido)
                 db.add(m)
                 await db.commit()
                 await db.refresh(m, attribute_names=["autor"])
 
-            payload = _serialize_mensaje(m)
-            payload["type"] = "mensaje"
-
-            # 4. Broadcast a TODOS (participantes y espectadores).
-            await manager.broadcast(tarea_id, payload)
-
-            # 5. OneSignal SOLO a participantes desconectados (sin el autor).
-            conectados = manager.connected_participant_ids(tarea_id)
-            destinatarios = {
-                uid for uid in participantes
-                if uid not in conectados and uid != user.id
-            }
-            if destinatarios:
-                await notify_users(
-                    destinatarios,
-                    title=f"Chat: {tarea.titulo}",
-                    message=f"{user.name}: {contenido[:80]}",
-                    data={
-                        "tarea_id": str(tarea_id),
-                        "mensaje_id": str(m.id),
-                        "action": "chat.message",
-                    },
-                    android_group=f"chat:{tarea_id}",
-                    thread_id=f"chat:{tarea_id}",
-                    name="chat.message",
-                )
+            payload = _serialize_mensaje(m, [])
+            await _broadcast_y_notificar(tarea, participantes, user, payload, preview=contenido)
     except WebSocketDisconnect:
         pass
     finally:
