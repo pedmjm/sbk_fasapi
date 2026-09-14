@@ -72,6 +72,7 @@ from notifications import notify_users
 from schemas import (
     Envelope,
     ImagenOut,
+    RevisionMotivoBody,
     TareaCreate,
     TareaNested,
     TareaUpdate,
@@ -174,6 +175,26 @@ async def _resolve_personal_users(
         await db.execute(select(User).where(User.cedula.in_(cedulas)))
     ).scalars().all()
     return [u.id for u in users]
+
+
+async def _notificar_participantes(
+    db: AsyncSession, tarea: Tarea, *, titulo: str, mensaje: str, data: dict
+) -> None:
+    """Push al creador + usuarios del personal asignado (best-effort)."""
+    stmt = select(Tarea).options(selectinload(Tarea.personal)).where(Tarea.id == tarea.id)
+    tarea_con_personal = (await db.execute(stmt)).scalar_one_or_none()
+    if not tarea_con_personal:
+        return
+    ids = {tarea_con_personal.creador_id}
+    ids.update(
+        await _resolve_personal_users(db, [p.id for p in tarea_con_personal.personal])
+    )
+    if ids:
+        await notify_users(
+            ids, title=titulo, message=mensaje, data=data,
+            android_group="tareas", thread_id="tareas",
+            collapse_id=f"tarea:{tarea.id}",
+        )
 
 
 # ─── Tarea CRUD ─────────────────────────────────────────────────────────────
@@ -517,10 +538,10 @@ async def update_tarea(
 
     data = body.model_dump(exclude_unset=True)
 
-    if tarea.estado in (EstadoTarea.COMPLETADA, EstadoTarea.CANCELADA):
+    if tarea.estado in (EstadoTarea.EN_REVISION, EstadoTarea.COMPLETADA, EstadoTarea.CANCELADA):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Tarea completada/cancelada no editable",
+            detail="Tarea en revisión/completada/cancelada no editable",
         )
 
     # ✅ En progreso SOLO se permite reasignar el personal (the GUI's
@@ -1215,17 +1236,108 @@ async def update_consumible_estado(
 async def completar_tarea(
     tarea_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
-    current_user: Annotated[User, Depends(require_nivel(1))],
+    current_user: Annotated[User, Depends(get_current_active_user)],
 ):
-    """Marca la tarea como completada."""
+    """Envía la tarea a revisión: en_progreso → **en_revision** (cualquier
+    usuario autenticado). Un revisor (nivel >= 2) la aprueba
+    (`/aprobar` → completada) o la devuelve (`/devolver` → en_progreso)."""
     result = await db.execute(select(Tarea).where(Tarea.id == tarea_id))
     tarea = result.scalar_one_or_none()
     if not tarea:
         raise HTTPException(status_code=404, detail="Tarea no encontrada")
-    
+
+    if tarea.estado != EstadoTarea.EN_PROGRESO:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"No se puede enviar a revisión una tarea en estado '{tarea.estado.value}' (debe estar en_progreso)",
+        )
+
+    tarea.estado = EstadoTarea.EN_REVISION
+    await db.commit()
+
+    # Push a los revisores (nivel >= 2).
+    revisores = (
+        await db.execute(
+            select(User.id).where(User.nivel >= 2, User.disabled == False)  # noqa: E712
+        )
+    ).scalars().all()
+    revisores = [r for r in revisores if r != current_user.id]
+    if revisores:
+        await notify_users(
+            revisores,
+            title="Tarea enviada a revisión",
+            message=f"{tarea.titulo} — esperando cierre",
+            data={"tarea_id": str(tarea_id), "action": "tarea.revision"},
+            android_group="tareas",
+            thread_id="tareas",
+            collapse_id=f"tarea:{tarea_id}",
+            name="tarea.revision",
+        )
+
+    return Envelope(message="Tarea enviada a revisión")
+
+
+@router.post("/{tarea_id}/aprobar", response_model=Envelope)
+async def aprobar_tarea(
+    tarea_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _revisor: Annotated[User, Depends(require_nivel(2))],
+):
+    """Revisor (nivel >= 2): cierra la tarea en revisión → completada."""
+    result = await db.execute(select(Tarea).where(Tarea.id == tarea_id))
+    tarea = result.scalar_one_or_none()
+    if not tarea:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+
+    if tarea.estado != EstadoTarea.EN_REVISION:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"La tarea está '{tarea.estado.value}' — solo se aprueba desde 'en_revision'",
+        )
+
     tarea.estado = EstadoTarea.COMPLETADA
     await db.commit()
-    return Envelope(message="Tarea marcada como completada")
+
+    await _notificar_participantes(
+        db, tarea,
+        titulo="Tarea aprobada",
+        mensaje=f"'{tarea.titulo}' fue cerrada por revisión",
+        data={"tarea_id": str(tarea_id), "action": "tarea.aprobada"},
+    )
+    return Envelope(message="Tarea aprobada (completada)")
+
+
+@router.post("/{tarea_id}/devolver", response_model=Envelope)
+async def devolver_tarea(
+    tarea_id: uuid.UUID,
+    body: RevisionMotivoBody,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _revisor: Annotated[User, Depends(require_nivel(2))],
+):
+    """Revisor (nivel >= 2): devuelve la tarea en revisión → en_progreso
+    (editable de nuevo: pasos, comentarios, imágenes, etc.)."""
+    result = await db.execute(select(Tarea).where(Tarea.id == tarea_id))
+    tarea = result.scalar_one_or_none()
+    if not tarea:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+
+    if tarea.estado != EstadoTarea.EN_REVISION:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"La tarea está '{tarea.estado.value}' — solo se devuelve desde 'en_revision'",
+        )
+
+    tarea.estado = EstadoTarea.EN_PROGRESO
+    await db.commit()
+
+    await _notificar_participantes(
+        db, tarea,
+        titulo="Tarea devuelta",
+        mensaje=(f"Devuelta a en_progreso: {body.motivo}" if body.motivo
+                 else "Devuelta a en_progreso para correcciones"),
+        data={"tarea_id": str(tarea_id), "action": "tarea.devuelta"},
+    )
+    return Envelope(message="Tarea devuelta a en_progreso")
 
 
 @router.post("/{tarea_id}/cancelar", response_model=Envelope)
@@ -1234,7 +1346,19 @@ async def cancelar_tarea(
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[User, Depends(require_nivel(1))],
 ):
-    # similar
+    result = await db.execute(select(Tarea).where(Tarea.id == tarea_id))
+    tarea = result.scalar_one_or_none()
+    if not tarea:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+
+    if tarea.estado == EstadoTarea.COMPLETADA:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="No se puede cancelar una tarea completada")
+    if tarea.estado == EstadoTarea.EN_REVISION and current_user.nivel < 2:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="La tarea está en revisión: solo un revisor (nivel >= 2) puede cancelarla",
+        )
+
     tarea.estado = EstadoTarea.CANCELADA
     await db.commit()
     return Envelope(message="Tarea cancelada")

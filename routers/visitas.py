@@ -39,7 +39,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from auth import get_current_active_user
+from auth import get_current_active_user, require_nivel
 from database import get_db
 from models import (
     Cliente,
@@ -58,6 +58,7 @@ from schemas import (
     FinalizarVisitaBody,
     ImagenOut,
     PersonalOut,
+    RevisionMotivoBody,
     SucursalOut,
     VisitaCreate,
     VisitaOut,
@@ -134,6 +135,33 @@ async def _personal_user_id(db: AsyncSession, personal_id: uuid.UUID) -> Optiona
         return None
     u = (await db.execute(select(User).where(User.cedula == p.cedula))).scalar_one_or_none()
     return u.id if u else None
+
+
+async def _revisores_ids(db: AsyncSession) -> list[uuid.UUID]:
+    """User ids de los revisores (nivel >= 2, activos)."""
+    rows = (
+        await db.execute(
+            select(User.id).where(User.nivel >= 2, User.disabled == False)  # noqa: E712
+        )
+    ).scalars().all()
+    return list(rows)
+
+
+async def _notificar_cierre_o_devolucion(
+    db: AsyncSession, visita: Visita, titulo: str, mensaje: str, data: dict
+) -> None:
+    """Push al creador + técnico asignado (si tienen user vinculado)."""
+    ids: set[uuid.UUID] = set()
+    if visita.creador_id:
+        ids.add(visita.creador_id)
+    if visita.personal_id:
+        uid = await _personal_user_id(db, visita.personal_id)
+        if uid:
+            ids.add(uid)
+    if ids:
+        await notify_users(ids, title=titulo, message=mensaje, data=data,
+                           android_group="visitas", thread_id="visitas",
+                           collapse_id=f"visita:{visita.id}")
 
 
 # ─── CRUD ───────────────────────────────────────────────────────────────────
@@ -242,6 +270,8 @@ async def get_visita(
     _current_user: Annotated[User, Depends(get_current_active_user)],
 ):
     visita = await _fetch_visita(db, visita_id)
+
+    print("visita saved data:", _serialize_visita(visita))
     if not visita:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Visita no encontrada")
     await _load_visita_imagenes(db, visita)
@@ -255,18 +285,20 @@ async def update_visita(
     db: Annotated[AsyncSession, Depends(get_db)],
     _current_user: Annotated[User, Depends(get_current_active_user)],
 ):
+    print("visita data:", body)
     visita = await _fetch_visita(db, visita_id)
     if not visita:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Visita no encontrada")
 
-    if visita.estado in (EstadoVisita.FINALIZADA, EstadoVisita.CANCELADA):
+    if visita.estado in (EstadoVisita.EN_REVISION, EstadoVisita.FINALIZADA, EstadoVisita.CANCELADA):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"No se puede editar una visita {visita.estado.value}",
+            detail=f"No se puede editar una visita {visita.estado.value}"
+            " (en revisión/finalizada/cancelada; pide que la devuelvan a en_progreso)",
         )
 
     data = body.model_dump(exclude_unset=True)
-
+    print("visita data:", data)
     if "cliente_id" in data and data["cliente_id"] is not None:
         exists = (await db.execute(select(Cliente.id).where(Cliente.id == data["cliente_id"]))).scalar_one_or_none()
         if not exists:
@@ -295,20 +327,25 @@ async def finalizar_visita(
     visita_id: uuid.UUID,
     body: FinalizarVisitaBody,
     db: Annotated[AsyncSession, Depends(get_db)],
-    _current_user: Annotated[User, Depends(get_current_active_user)],
+    current_user: Annotated[User, Depends(get_current_active_user)],
 ):
-    """Marca la visita como finalizada, registrando el resultado de la
-    inspección (incidencias, observaciones, detalles técnicos)."""
+    """Marca la visita como realizada → estado **en_revision** (cualquier
+    usuario autenticado puede enviarla). Registra el resultado de la
+    inspección (incidencias, observaciones, detalles técnicos). Un
+    revisor (nivel >= 2) la cierra (`/cerrar`) o la devuelve
+    (`/devolver`) a en_progreso."""
     visita = await _fetch_visita(db, visita_id)
     if not visita:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Visita no encontrada")
 
     if visita.estado == EstadoVisita.CANCELADA:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="No se puede finalizar una visita cancelada")
+    if visita.estado == EstadoVisita.EN_REVISION:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="La visita ya está en revisión")
     if visita.estado == EstadoVisita.FINALIZADA:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="La visita ya está finalizada")
 
-    visita.estado = EstadoVisita.FINALIZADA
+    visita.estado = EstadoVisita.EN_REVISION
     data = body.model_dump(exclude_unset=True)
     for k in ("incidencias", "observaciones", "detalles_tecnicos"):
         if k in data:
@@ -317,14 +354,95 @@ async def finalizar_visita(
     await db.commit()
     visita = await _fetch_visita(db, visita_id)
     await _load_visita_imagenes(db, visita)
-    return Envelope(message="Visita finalizada", data=_serialize_visita(visita))
+
+    # Push a los revisores (nivel >= 2).
+    revisores = await _revisores_ids(db)
+    revisores = [r for r in revisores if r != current_user.id]
+    if revisores:
+        await notify_users(
+            revisores,
+            title="Visita enviada a revisión",
+            message=f"{visita.cliente.razon_social if visita.cliente else 'Visita'} — esperando cierre",
+            data={"visita_id": str(visita_id), "action": "visita.revision"},
+            android_group="visitas",
+            thread_id="visitas",
+            collapse_id=f"visita:{visita_id}",
+            name="visita.revision",
+        )
+
+    return Envelope(message="Visita enviada a revisión", data=_serialize_visita(visita))
+
+
+@router.post("/{visita_id}/cerrar", response_model=Envelope)
+async def cerrar_visita(
+    visita_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _revisor: Annotated[User, Depends(require_nivel(2))],
+):
+    """Revisor (nivel >= 2): cierra la visita en revisión → finalizada."""
+    visita = await _fetch_visita(db, visita_id)
+    if not visita:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Visita no encontrada")
+
+    if visita.estado != EstadoVisita.EN_REVISION:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"La visita está '{visita.estado.value}' — solo se cierra desde 'en_revision'",
+        )
+
+    visita.estado = EstadoVisita.FINALIZADA
+    await db.commit()
+    visita = await _fetch_visita(db, visita_id)
+    await _load_visita_imagenes(db, visita)
+
+    await _notificar_cierre_o_devolucion(
+        db, visita,
+        titulo="Visita aprobada",
+        mensaje=f"'{visita.cliente.razon_social if visita.cliente else visita_id}' fue cerrada por revisión",
+        data={"visita_id": str(visita_id), "action": "visita.cerrada"},
+    )
+    return Envelope(message="Visita cerrada (finalizada)", data=_serialize_visita(visita))
+
+
+@router.post("/{visita_id}/devolver", response_model=Envelope)
+async def devolver_visita(
+    visita_id: uuid.UUID,
+    body: RevisionMotivoBody,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _revisor: Annotated[User, Depends(require_nivel(2))],
+):
+    """Revisor (nivel >= 2): devuelve la visita en revisión → en_progreso
+    (editable de nuevo: imágenes, comentarios, edición, etc.)."""
+    visita = await _fetch_visita(db, visita_id)
+    if not visita:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Visita no encontrada")
+
+    if visita.estado != EstadoVisita.EN_REVISION:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"La visita está '{visita.estado.value}' — solo se devuelve desde 'en_revision'",
+        )
+
+    visita.estado = EstadoVisita.EN_PROGRESO
+    await db.commit()
+    visita = await _fetch_visita(db, visita_id)
+    await _load_visita_imagenes(db, visita)
+
+    await _notificar_cierre_o_devolucion(
+        db, visita,
+        titulo="Visita devuelta",
+        mensaje=(f"Devuelta a en_progreso: {body.motivo}" if body.motivo
+                 else "Devuelta a en_progreso para correcciones"),
+        data={"visita_id": str(visita_id), "action": "visita.devuelta"},
+    )
+    return Envelope(message="Visita devuelta a en_progreso", data=_serialize_visita(visita))
 
 
 @router.post("/{visita_id}/cancelar", response_model=Envelope)
 async def cancelar_visita(
     visita_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
-    _current_user: Annotated[User, Depends(get_current_active_user)],
+    current_user: Annotated[User, Depends(get_current_active_user)],
 ):
     visita = await _fetch_visita(db, visita_id)
     if not visita:
@@ -332,13 +450,36 @@ async def cancelar_visita(
 
     if visita.estado == EstadoVisita.FINALIZADA:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="No se puede cancelar una visita finalizada")
+    if visita.estado == EstadoVisita.EN_REVISION and current_user.nivel < 2:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="La visita está en revisión: solo un revisor (nivel >= 2) puede cancelarla",
+        )
 
     visita.estado = EstadoVisita.CANCELADA
     await db.commit()
     return Envelope(message="Visita cancelada")
 
 
-# ─── Evidencias fotográficas ────────────────────────────────────────────────
+# ─── Evidencias fotográficas (solo con la visita ABIERTA) ──────────────────
+
+# Estados donde aún se puede subir/eliminar imágenes.
+_ESTADOS_ABIERTOS = (EstadoVisita.PROGRAMADA, EstadoVisita.EN_PROGRESO)
+
+
+def _check_visita_abierta(visita: Visita) -> None:
+    """Subir y eliminar imágenes solo es posible mientras la visita esté
+    abierta (programada / en_progreso). En revisión, finalizada o
+    cancelada → 422 (pide que la devuelvan a en_progreso)."""
+    if visita.estado not in _ESTADOS_ABIERTOS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"La visita está '{visita.estado.value}': solo se pueden gestionar "
+                "imágenes mientras esté abierta (programada/en_progreso)"
+            ),
+        )
+
 
 @router.post("/{visita_id}/imagenes", response_model=Envelope, status_code=status.HTTP_201_CREATED)
 async def upload_visita_imagenes(
@@ -350,6 +491,7 @@ async def upload_visita_imagenes(
     visita = await _fetch_visita(db, visita_id)
     if not visita:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Visita no encontrada")
+    _check_visita_abierta(visita)
 
     saved: list[Imagen] = []
     for f in imagenes:
@@ -372,6 +514,41 @@ async def upload_visita_imagenes(
         message=f"{len(saved)} imagen(es) adjuntada(s)",
         data=[ImagenOut.model_validate(img).model_dump(mode="json") for img in saved],
     )
+
+
+@router.delete("/{visita_id}/imagenes/{imagen_id}", response_model=Envelope)
+async def delete_visita_imagen(
+    visita_id: uuid.UUID,
+    imagen_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _current_user: Annotated[User, Depends(get_current_active_user)],
+):
+    """Elimina una evidencia fotográfica de la visita (fila + archivo
+    físico). Solo con la visita abierta."""
+    visita = await _fetch_visita(db, visita_id)
+    if not visita:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Visita no encontrada")
+    _check_visita_abierta(visita)
+
+    img = (
+        await db.execute(
+            select(Imagen).where(
+                Imagen.id == imagen_id,
+                Imagen.imageable_type == "Visita",
+                Imagen.imageable_id == str(visita_id),
+            )
+        )
+    ).scalar_one_or_none()
+    if not img:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Imagen no encontrada en esta visita",
+        )
+
+    delete_rel_path(img.path)
+    await db.delete(img)
+    await db.commit()
+    return Envelope(message="Imagen eliminada")
 
 
 @router.delete("/{visita_id}", response_model=Envelope)

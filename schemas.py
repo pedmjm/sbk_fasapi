@@ -711,6 +711,8 @@ class VisitaUpdate(BaseModel):
     fecha: Optional[datetime] = None
     ubicacion: Optional[str] = Field(None, max_length=255)
     descripcion: Optional[str] = None
+    incidencias: Optional[str] = None
+    observaciones: Optional[str] = None
     telefono_contacto: Optional[str] = Field(None, max_length=50)
     detalles_tecnicos: Optional[dict[str, Any]] = None
 
@@ -720,6 +722,11 @@ class FinalizarVisitaBody(BaseModel):
     incidencias: Optional[str] = None
     observaciones: Optional[str] = None
     detalles_tecnicos: Optional[dict[str, Any]] = None
+
+
+class RevisionMotivoBody(BaseModel):
+    """Body opcional de devolver (revisión → en_progreso)."""
+    motivo: Optional[str] = None
 
 
 class VisitaOut(BaseModel):

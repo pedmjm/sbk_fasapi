@@ -167,10 +167,12 @@ async def list_pickings(
         ).scalar_one_or_none()
         
         if my_personal:
+            # my_personal is already the raw UUID (select(Personal.id) +
+            # scalar_one_or_none) — compare directly, no .id attribute.
             my_picking_ids = (
                 await db.execute(
                     select(picking_personal.c.picking_id).where(
-                        picking_personal.c.personal_id == my_personal.id
+                        picking_personal.c.personal_id == my_personal
                     )
                 )
             ).scalars().all()

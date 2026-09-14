@@ -116,6 +116,7 @@ class EstadoPicking(str, enum.Enum):
 class EstadoTarea(str, enum.Enum):
     PENDIENTE = "pendiente"
     EN_PROGRESO = "en_progreso"
+    EN_REVISION = "en_revision"
     COMPLETADA = "completada"
     CANCELADA = "cancelada"
 
@@ -123,6 +124,7 @@ class EstadoTarea(str, enum.Enum):
 class EstadoVisita(str, enum.Enum):
     PROGRAMADA = "programada"
     EN_PROGRESO = "en_progreso"
+    EN_REVISION = "en_revision"
     FINALIZADA = "finalizada"
     CANCELADA = "cancelada"
 

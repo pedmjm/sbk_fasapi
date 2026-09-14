@@ -72,10 +72,21 @@ import json
 router = APIRouter(tags=["pasos"])
 
 
-def _puede_gestionar_pasos(tarea: Tarea, user: User) -> bool:
+def _puede_gestionar_pasos(tarea: Tarea, user: User) -> None:
     """Agregar/quitar pasos (incluso con la tarea en progreso): solo el
-    creador de la tarea o un admin (nivel >= 2)."""
-    return tarea.creador_id == user.id or user.nivel >= 2
+    creador de la tarea o un admin (nivel >= 2). En `en_revision` la
+    tarea está bloqueada: el revisor debe devolverla a en_progreso
+    para poder editar."""
+    if tarea.estado == EstadoTarea.EN_REVISION:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="La tarea está en revisión: pide que la devuelvan a en_progreso para editar los pasos",
+        )
+    if tarea.creador_id != user.id and user.nivel < 2:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo el creador de la tarea (o un admin) puede gestionar los pasos.",
+        )
 
 
 async def _delete_imagen_row(db: AsyncSession, img: Imagen) -> None:
@@ -160,11 +171,7 @@ async def add_paso(
     ).scalar_one_or_none()
     if not tarea:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tarea no encontrada")
-    if not _puede_gestionar_pasos(tarea, _current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Solo el creador de la tarea (o un admin) puede agregar pasos.",
-        )
+    _puede_gestionar_pasos(tarea, _current_user)
 
     paso = PasosTarea(tarea_id=tarea_id, **body.model_dump())
     db.add(paso)
@@ -236,11 +243,7 @@ async def delete_paso(
     paso = await _fetch_paso(db, tarea_id, paso_id)
     if not paso:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Paso no encontrado")
-    if not _puede_gestionar_pasos(paso.tarea, _current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Solo el creador de la tarea (o un admin) puede eliminar pasos.",
-        )
+    _puede_gestionar_pasos(paso.tarea, _current_user)
 
     # Comments live on the paso now: delete their Imagen rows + physical
     # files before the cascade removes the rows (otherwise they orphan).
