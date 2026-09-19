@@ -147,6 +147,11 @@ async def _revisores_ids(db: AsyncSession) -> list[uuid.UUID]:
     return list(rows)
 
 
+async def _otros_admins_ids(db: AsyncSession, excepto_id: uuid.UUID) -> list[uuid.UUID]:
+    """User ids de los demás admins activos (nivel >= 2)."""
+    return [i for i in await _revisores_ids(db) if i != excepto_id]
+
+
 async def _notificar_cierre_o_devolucion(
     db: AsyncSession, visita: Visita, titulo: str, mensaje: str, data: dict
 ) -> None:
@@ -270,8 +275,6 @@ async def get_visita(
     _current_user: Annotated[User, Depends(get_current_active_user)],
 ):
     visita = await _fetch_visita(db, visita_id)
-
-    print("visita saved data:", _serialize_visita(visita))
     if not visita:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Visita no encontrada")
     await _load_visita_imagenes(db, visita)
@@ -327,13 +330,12 @@ async def finalizar_visita(
     visita_id: uuid.UUID,
     body: FinalizarVisitaBody,
     db: Annotated[AsyncSession, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_active_user)],
+    current_user: Annotated[User, Depends(require_nivel(1))],
 ):
-    """Marca la visita como realizada → estado **en_revision** (cualquier
-    usuario autenticado puede enviarla). Registra el resultado de la
-    inspección (incidencias, observaciones, detalles técnicos). Un
-    revisor (nivel >= 2) la cierra (`/cerrar`) o la devuelve
-    (`/devolver`) a en_progreso."""
+    """Marca la visita como realizada → estado **en_revision** (nivel ≥ 1).
+    Registra el resultado de la inspección (incidencias, observaciones,
+    detalles técnicos). Un revisor (nivel >= 2) la cierra (`/cerrar`) o la
+    devuelve (`/devolver`) a en_progreso."""
     visita = await _fetch_visita(db, visita_id)
     if not visita:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Visita no encontrada")
@@ -436,6 +438,104 @@ async def devolver_visita(
         data={"visita_id": str(visita_id), "action": "visita.devuelta"},
     )
     return Envelope(message="Visita devuelta a en_progreso", data=_serialize_visita(visita))
+
+
+@router.post("/{visita_id}/reabrir", response_model=Envelope)
+async def reabrir_visita(
+    visita_id: uuid.UUID,
+    body: RevisionMotivoBody,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _revisor: Annotated[User, Depends(require_nivel(2))],
+):
+    """Revisor (nivel >= 2): devuelve una visita FINALIZADA a en_revision,
+    para luego decidir con /devolver (abrir) o /cerrar (cerrar). El
+    informe (si existe) permanece anclado a la visita."""
+    visita = await _fetch_visita(db, visita_id)
+    if not visita:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Visita no encontrada")
+
+    if visita.estado != EstadoVisita.FINALIZADA:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"La visita está '{visita.estado.value}' — solo se reabre desde 'finalizada'",
+        )
+
+    visita.estado = EstadoVisita.EN_REVISION
+    await db.commit()
+    visita = await _fetch_visita(db, visita_id)
+    await _load_visita_imagenes(db, visita)
+
+    await _notificar_cierre_o_devolucion(
+        db, visita,
+        titulo="Visita reabierta a revisión",
+        mensaje=(f"{body.motivo}" if body.motivo
+                 else "Reabierta a revisión para reevaluación"),
+        data={"visita_id": str(visita_id), "action": "visita.reabierta"},
+    )
+    return Envelope(message="Visita reabierta a revisión", data=_serialize_visita(visita))
+
+
+@router.post("/{visita_id}/marcar-eliminar", response_model=Envelope)
+async def marcar_eliminar_visita(
+    visita_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(require_nivel(2))],
+):
+    """Admin (nivel >= 2): marca la visita para eliminar (cualquier
+    estado). La eliminación real la confirma OTRO admin vía DELETE —
+    quien marcó no puede eliminarla (principio de 4 ojos)."""
+    visita = await _fetch_visita(db, visita_id)
+    if not visita:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Visita no encontrada")
+
+    visita.eliminar_marcada = True
+    visita.eliminar_marcada_por_id = current_user.id
+    await db.commit()
+
+    otros = await _otros_admins_ids(db, current_user.id)
+    if otros:
+        await notify_users(
+            otros,
+            title="Visita marcada para eliminar",
+            message=f"{visita.cliente.razon_social if visita.cliente else 'Visita'} — requiere confirmación de otro administrador",
+            data={"visita_id": str(visita_id), "action": "visita.eliminar_marcada"},
+            android_group="visitas",
+            thread_id="visitas",
+            name="visita.eliminar_marcada",
+        )
+
+    return Envelope(
+        message="Visita marcada para eliminar — otro administrador debe confirmar",
+        data={"id": str(visita_id), "eliminar_marcada": True,
+              "eliminar_marcada_por_id": str(current_user.id)},
+    )
+
+
+@router.post("/{visita_id}/desmarcar-eliminar", response_model=Envelope)
+async def desmarcar_eliminar_visita(
+    visita_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _admin: Annotated[User, Depends(require_nivel(2))],
+):
+    """Admin (nivel >= 2): cancela la solicitud de eliminación."""
+    visita = await _fetch_visita(db, visita_id)
+    if not visita:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Visita no encontrada")
+
+    if not visita.eliminar_marcada:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="La visita no está marcada para eliminar",
+        )
+
+    visita.eliminar_marcada = False
+    visita.eliminar_marcada_por_id = None
+    await db.commit()
+    return Envelope(
+        message="Solicitud de eliminación cancelada",
+        data={"id": str(visita_id), "eliminar_marcada": False,
+              "eliminar_marcada_por_id": None},
+    )
 
 
 @router.post("/{visita_id}/cancelar", response_model=Envelope)
@@ -555,11 +655,25 @@ async def delete_visita_imagen(
 async def delete_visita(
     visita_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
-    _current_user: Annotated[User, Depends(get_current_active_user)],
+    current_user: Annotated[User, Depends(require_nivel(2))],
 ):
+    """Elimina la visita — eliminación en DOS PASOS (4 ojos):
+    1) un admin la marcó (`/marcar-eliminar`),
+    2) OTRO admin distinto confirma aquí."""
     visita = await _fetch_visita(db, visita_id)
     if not visita:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Visita no encontrada")
+
+    if not visita.eliminar_marcada:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="La visita debe estar marcada para eliminar antes (POST /visitas/{id}/marcar-eliminar)",
+        )
+    if visita.eliminar_marcada_por_id is not None and str(visita.eliminar_marcada_por_id) == str(current_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="El administrador que marcó la visita no puede eliminarla — requiere confirmación de otro administrador",
+        )
 
     # 1. Delete every Imagen row referencing this Visita AND the physical
     #    files. (The informe cascades via FK and has no files.)

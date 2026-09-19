@@ -46,6 +46,7 @@ from sqlalchemy import (
     func,
     Uuid,
     JSON,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
@@ -635,6 +636,17 @@ class Tarea(Base):
         nullable=False,
     )
 
+    # ─── Eliminación en dos pasos (4 ojos) ──
+    # Solo admins (nivel >= 2) marcan; la eliminación real (DELETE)
+    # requiere OTRO admin distinto al que marcó.
+    eliminar_marcada: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, server_default=text("false")
+    )
+    eliminar_marcada_por_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
     # Relationships
     cliente: Mapped[Cliente] = relationship()
     sucursal: Mapped[Sucursal] = relationship()
@@ -923,6 +935,17 @@ class Visita(Base):
         default=EstadoVisita.PROGRAMADA,
         nullable=False,
     )
+
+    # ─── Eliminación en dos pasos (4 ojos) ──
+    # Solo admins (nivel >= 2) marcan; la eliminación real (DELETE)
+    # requiere OTRO admin distinto al que marcó.
+    eliminar_marcada: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, server_default=text("false")
+    )
+    eliminar_marcada_por_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     # Free-form parameters evaluated during the visit, e.g.
     # {"Voltaje de Línea (V)": "440", "Temperatura Operativa (°C)": "62"}
     detalles_tecnicos: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
@@ -940,10 +963,12 @@ class Visita(Base):
     )
 
     # Relationships
+    # foreign_keys explícito: hay dos FKs a users (creador_id y
+    # eliminar_marcada_por_id) y SQLAlchemy no puede elegir solo.
     cliente: Mapped[Cliente] = relationship()
     sucursal: Mapped[Optional[Sucursal]] = relationship()
     personal: Mapped[Optional[Personal]] = relationship()
-    creador: Mapped[User] = relationship()
+    creador: Mapped[User] = relationship(foreign_keys=[creador_id])
     informe: Mapped[Optional["InformeTecnico"]] = relationship(
         back_populates="visita",
         cascade="all, delete-orphan",

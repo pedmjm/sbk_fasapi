@@ -349,6 +349,9 @@ class TareaOut(BaseModel):
     creador_id: uuid.UUID
     created_at: datetime
     estado: str
+    # Eliminación en dos pasos (4 ojos)
+    eliminar_marcada: bool = False
+    eliminar_marcada_por_id: Optional[uuid.UUID] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -745,6 +748,9 @@ class VisitaOut(BaseModel):
     observaciones: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+    # Eliminación en dos pasos (4 ojos)
+    eliminar_marcada: bool = False
+    eliminar_marcada_por_id: Optional[uuid.UUID] = None
 
     model_config = ConfigDict(from_attributes=True)
 

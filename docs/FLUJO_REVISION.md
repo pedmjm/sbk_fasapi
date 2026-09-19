@@ -15,21 +15,31 @@ visita abierta).
 
 ```text
 pendiente ──iniciar──► en_progreso ──completar──► en_revision ──aprobar (nivel≥2)──► completada
-    │                     ▲   │                      │
-    │                     │   └──────────────────────┘
-    │                     └────devolver (nivel≥2)──────┘
-    └──cancelar──► cancelada        (desde en_revision, cancelar solo nivel≥2)
+    │                     ▲   │                      │                                  │
+    │                     │   └──────────────────────┘                     reabrir (nivel≥2)
+    │                     └────devolver (nivel≥2)──────┘                          │
+    └──cancelar──► cancelada        (desde en_revision, cancelar solo nivel≥2)    ▼
+                                                               (vuelve a en_revision)
 ```
 
 ### Visitas
 
 ```text
 programada ──► en_progreso ──finalizar──► en_revision ──cerrar (nivel≥2)──► finalizada ──► informe opcional
-                  ▲   │                      │
-                  │   └──────────────────────┘
-                  └────devolver (nivel≥2)──────┘
-   (desde en_revision, cancelar solo nivel≥2)
+                  ▲   │                      │                                   │
+                  │   └──────────────────────┘                        reabrir (nivel≥2)
+                  └────devolver (nivel≥2)──────┘                               │
+   (desde en_revision, cancelar solo nivel≥2)                                    ▼
+                                                                (vuelve a en_revision)
 ```
+
+> **✅ SÍ se puede volver a revisar una actividad cerrada** (antes no se
+> podía): `POST /tareas/{id}/reabrir` (desde `completada`) y
+> `POST /visitas/{id}/reabrir` (desde `finalizada`) la devuelven a
+> `en_revision`, y desde ahí se decide otra vez con `devolver` (abrir a
+> en_progreso) o `aprobar`/`cerrar` (cerrar de nuevo). Requiere nivel ≥ 2;
+> body opcional `{"motivo": "..."}` (notifica a creador+asignados). El
+> informe de una visita reabierta permanece anclado (no se toca).
 
 > **Cambió el significado de los botones existentes:**
 > * `POST /tareas/{id}/completar` ya NO marca `completada` — ahora envía a
@@ -59,8 +69,10 @@ en revisión/cerrada/cancelada).
 |---|---|---|
 | `POST /tareas/{id}/aprobar` | Cierra la tarea | `en_revision` → `completada` |
 | `POST /tareas/{id}/devolver` | Devuelve para edición. Body opcional `{"motivo": "..."}` | `en_revision` → `en_progreso` |
+| `POST /tareas/{id}/reabrir` | Reabre una tarea ya cerrada. Body opcional `{"motivo": "..."}` | `completada` → `en_revision` |
 | `POST /visitas/{id}/cerrar` | Cierra la visita | `en_revision` → `finalizada` |
 | `POST /visitas/{id}/devolver` | Devuelve para edición. Body opcional `{"motivo": "..."}` | `en_revision` → `en_progreso` |
+| `POST /visitas/{id}/reabrir` | Reabre una visita ya cerrada. Body opcional `{"motivo": "..."}` | `finalizada` → `en_revision` |
 
 ```bash
 # técnico envía a revisión
@@ -141,6 +153,7 @@ curl -X DELETE "$BASE/visitas/$VISITA_ID/imagenes/$IMAGEN_ID" \
 |---|---|
 | Botón "Finalizar tarea/visita" | Sigue igual (mismo endpoint) pero ahora lleva a `en_revision` — mostrar estado "En revisión" |
 | Detalle tarea/visita en `en_revision` | Ocultar edición: pasos, personal, imágenes, comentarios. Mostrar botones **Aprobar/Devolver** SOLO si `nivel >= 2` (con diálogo de motivo al devolver) |
+| Detalle tarea `completada` / visita `finalizada` | Botón **"Reabrir a revisión"** para `nivel >= 2` (con motivo opcional) → vuelve a `en_revision` y reaparecen Aprobar/Devolver |
 | Lista de pendientes de revisión (nuevo) | Filtrar `GET /tareas?...` / `GET /visitas?estado=en_revision` para el dashboard del revisor |
 | Galería de imágenes de visita | Agregar botón eliminar (X) por miniatura → `DELETE /visitas/{id}/imagenes/{imagen_id}`; ocultar upload y delete si la visita no está abierta |
 | "Informe técnico" de la visita | Habilitar solo con estado `finalizada` (post-cierre) |

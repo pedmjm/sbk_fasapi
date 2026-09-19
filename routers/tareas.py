@@ -682,13 +682,27 @@ async def update_tarea(
 async def delete_tarea(
     tarea_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
-    _current_user: Annotated[User, Depends(get_current_active_user)],
+    current_user: Annotated[User, Depends(require_nivel(2))],
 ):
+    """Elimina la tarea — eliminación en DOS PASOS (4 ojos):
+    1) un admin la marcó (`/marcar-eliminar`),
+    2) OTRO admin distinto confirma aquí."""
     tarea = (
         await db.execute(select(Tarea).where(Tarea.id == tarea_id))
     ).scalar_one_or_none()
     if not tarea:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tarea no encontrada")
+
+    if not tarea.eliminar_marcada:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="La tarea debe estar marcada para eliminar antes (POST /tareas/{id}/marcar-eliminar)",
+        )
+    if tarea.eliminar_marcada_por_id is not None and str(tarea.eliminar_marcada_por_id) == str(current_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="El administrador que marcó la tarea no puede eliminarla — requiere confirmación de otro administrador",
+        )
 
     # 1. Delete every Imagen row referencing this Tarea or its Comentarios,
     #    AND delete the physical files. (Laravel missed the comment-image
@@ -1232,15 +1246,25 @@ async def update_consumible_estado(
         data=ConsumibleEstadoOut.model_validate(estado_reg).model_dump()
     )
 
+async def _otros_admins_ids(db: AsyncSession, excepto_id: uuid.UUID) -> list[uuid.UUID]:
+    """User ids de los demás admins activos (nivel >= 2)."""
+    ids = (
+        await db.execute(
+            select(User.id).where(User.nivel >= 2, User.disabled == False)  # noqa: E712
+        )
+    ).scalars().all()
+    return [i for i in ids if i != excepto_id]
+
+
 @router.post("/{tarea_id}/completar", response_model=Envelope)
 async def completar_tarea(
     tarea_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_active_user)],
+    current_user: Annotated[User, Depends(require_nivel(1))],
 ):
-    """Envía la tarea a revisión: en_progreso → **en_revision** (cualquier
-    usuario autenticado). Un revisor (nivel >= 2) la aprueba
-    (`/aprobar` → completada) o la devuelve (`/devolver` → en_progreso)."""
+    """Envía la tarea a revisión: en_progreso → **en_revision** (nivel ≥ 1).
+    Un revisor (nivel >= 2) la aprueba (`/aprobar` → completada) o la
+    devuelve (`/devolver` → en_progreso)."""
     result = await db.execute(select(Tarea).where(Tarea.id == tarea_id))
     tarea = result.scalar_one_or_none()
     if not tarea:
@@ -1338,6 +1362,105 @@ async def devolver_tarea(
         data={"tarea_id": str(tarea_id), "action": "tarea.devuelta"},
     )
     return Envelope(message="Tarea devuelta a en_progreso")
+
+
+@router.post("/{tarea_id}/reabrir", response_model=Envelope)
+async def reabrir_tarea(
+    tarea_id: uuid.UUID,
+    body: RevisionMotivoBody,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _revisor: Annotated[User, Depends(require_nivel(2))],
+):
+    """Revisor (nivel >= 2): devuelve una tarea COMPLETADA a en_revision,
+    para luego decidir con /devolver (abrir) o /aprobar (cerrar)."""
+    result = await db.execute(select(Tarea).where(Tarea.id == tarea_id))
+    tarea = result.scalar_one_or_none()
+    if not tarea:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+
+    if tarea.estado != EstadoTarea.COMPLETADA:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"La tarea está '{tarea.estado.value}' — solo se reabre desde 'completada'",
+        )
+
+    tarea.estado = EstadoTarea.EN_REVISION
+    await db.commit()
+
+    await _notificar_participantes(
+        db, tarea,
+        titulo="Tarea reabierta a revisión",
+        mensaje=(f"{tarea.titulo}: {body.motivo}" if body.motivo
+                 else f"{tarea.titulo} fue reabierta a revisión"),
+        data={"tarea_id": str(tarea_id), "action": "tarea.reabierta"},
+    )
+    return Envelope(message="Tarea reabierta a revisión")
+
+
+@router.post("/{tarea_id}/marcar-eliminar", response_model=Envelope)
+async def marcar_eliminar_tarea(
+    tarea_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(require_nivel(2))],
+):
+    """Admin (nivel >= 2): marca la tarea para eliminar (cualquier
+    estado). La eliminación real la confirma OTRO admin vía DELETE —
+    quien marcó no puede eliminarla (principio de 4 ojos)."""
+    result = await db.execute(select(Tarea).where(Tarea.id == tarea_id))
+    tarea = result.scalar_one_or_none()
+    if not tarea:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+
+    tarea.eliminar_marcada = True
+    tarea.eliminar_marcada_por_id = current_user.id
+    await db.commit()
+
+    # Push a los demás admins: hace falta su confirmación.
+    otros = await _otros_admins_ids(db, current_user.id)
+    if otros:
+        await notify_users(
+            otros,
+            title="Tarea marcada para eliminar",
+            message=f"'{tarea.titulo}' — requiere confirmación de otro administrador",
+            data={"tarea_id": str(tarea_id), "action": "tarea.eliminar_marcada"},
+            android_group="tareas",
+            thread_id="tareas",
+            name="tarea.eliminar_marcada",
+        )
+
+    return Envelope(
+        message="Tarea marcada para eliminar — otro administrador debe confirmar",
+        data={"id": str(tarea_id), "eliminar_marcada": True,
+              "eliminar_marcada_por_id": str(current_user.id)},
+    )
+
+
+@router.post("/{tarea_id}/desmarcar-eliminar", response_model=Envelope)
+async def desmarcar_eliminar_tarea(
+    tarea_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _admin: Annotated[User, Depends(require_nivel(2))],
+):
+    """Admin (nivel >= 2): cancela la solicitud de eliminación."""
+    result = await db.execute(select(Tarea).where(Tarea.id == tarea_id))
+    tarea = result.scalar_one_or_none()
+    if not tarea:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+
+    if not tarea.eliminar_marcada:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="La tarea no está marcada para eliminar",
+        )
+
+    tarea.eliminar_marcada = False
+    tarea.eliminar_marcada_por_id = None
+    await db.commit()
+    return Envelope(
+        message="Solicitud de eliminación cancelada",
+        data={"id": str(tarea_id), "eliminar_marcada": False,
+              "eliminar_marcada_por_id": None},
+    )
 
 
 @router.post("/{tarea_id}/cancelar", response_model=Envelope)
