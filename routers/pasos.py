@@ -56,11 +56,12 @@ from models import (
     EstadoTarea,
     Imagen,
     PasosTarea,
+    PasoEdicion,
     Tarea,
     User,
 )
 from notifications import notify_users
-from schemas import ComentarioOut, Envelope, ImagenOut, PasoCreate, PasoOut, PasoUpdate
+from schemas import ComentarioOut, Envelope, ImagenOut, PasoCreate, PasoOut, PasoEdicionOut, PasoUpdate
 from storage_helpers import (
     build_public_url,
     delete_rel_path,
@@ -115,6 +116,7 @@ async def _fetch_paso(db: AsyncSession, tarea_id: uuid.UUID, paso_id: uuid.UUID)
         .options(
             selectinload(PasosTarea.comentarios).selectinload(Comentario.autor),
             selectinload(PasosTarea.tarea).selectinload(Tarea.personal),
+            selectinload(PasosTarea.ediciones).selectinload(PasoEdicion.editor),  # NEW
         )
         .where(PasosTarea.id == paso_id, PasosTarea.tarea_id == tarea_id)
     )
@@ -204,6 +206,7 @@ async def get_paso(
         "id": str(tarea.id),
         "titulo": tarea.titulo,
         "estado": tarea.estado.value,
+        "creador_id": str(tarea.creador_id),
         "cliente_id": str(tarea.cliente_id),
         "sucursal_id": str(tarea.sucursal_id),
         "fecha_limite": tarea.fecha_limite.isoformat() if tarea.fecha_limite else None,
@@ -223,11 +226,37 @@ async def update_paso(
     if not paso:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Paso no encontrado")
 
-    for k, v in body.model_dump(exclude_unset=True).items():
+    updates = body.model_dump(exclude_unset=True)
+
+    # ── Detect changes on the tracked fields ─────────────────────
+    tracked = ("actividad", "metodo", "requerimiento")
+    changed = {}
+    for field in tracked:
+        if field in updates and updates[field] != getattr(paso, field):
+            changed[field] = getattr(paso, field)  # snapshot del valor ANTERIOR
+
+    # ── If any tracked field changed → creator/admin only ───────
+    if changed:
+        _puede_gestionar_pasos(paso.tarea, _current_user)
+
+    # ── Apply ────────────────────────────────────────────────────
+    for k, v in updates.items():
         setattr(paso, k, v)
+
+    # ── Log the edit ─────────────────────────────────────────────
+    if changed:
+        db.add(
+            PasoEdicion(
+                paso_id=paso.id,
+                editor_id=_current_user.id,
+                actividad_anterior=changed.get("actividad"),
+                metodo_anterior=changed.get("metodo"),
+                requerimiento_anterior=changed.get("requerimiento"),
+            )
+        )
+
     await db.commit()
 
-    # Re-fetch so relations survive the commit's expiry.
     paso = await _fetch_paso(db, tarea_id, paso_id)
     await _hydrate_comentario_imagenes(db, paso.comentarios)
     return Envelope(message="Paso actualizado", data=_serialize_paso(paso))
@@ -479,3 +508,115 @@ async def delete_comentario(
     await db.delete(comentario)
     await db.commit()
     return Envelope(message="Comentario eliminado correctamente")
+
+
+@router.put("/comentarios/{comentario_id}", response_model=Envelope)
+async def update_comentario(
+    comentario_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    texto: Optional[str] = Form(default=None),
+    imagenes: list[UploadFile] = File(default=[]),
+    imagen_ids_eliminar: Optional[str] = Form(
+        default=None,
+        description="JSON list de ids de Imagen pertenecientes a este "
+                    "comentario que deben eliminarse.",
+    ),
+):
+    comentario = (
+        await db.execute(select(Comentario).where(Comentario.id == comentario_id))
+    ).scalar_one_or_none()
+    if not comentario:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="El comentario no existe o ya fue eliminado.",
+        )
+
+    # ── Only the original author can edit (admins do NOT override) ──
+    if comentario.autor_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo el autor puede editar este comentario.",
+        )
+
+    tarea = (
+        await db.execute(select(Tarea).where(Tarea.id == comentario.tarea_id))
+    ).scalar_one_or_none()
+    if not tarea:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+
+    if tarea.estado != EstadoTarea.EN_PROGRESO:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"No se puede editar: la tarea está '{tarea.estado.value}' "
+                "y debe estar 'en_progreso'."
+            ),
+        )
+
+    # ── Parse ids to delete ─────────────────────────────────────
+    delete_ids: list[int] = []
+    if imagen_ids_eliminar:
+        try:
+            delete_ids = [int(i) for i in json.loads(imagen_ids_eliminar)]
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"imagen_ids_eliminar no es una lista JSON válida: {exc}",
+            )
+
+    # ── Current images of THIS comment ──────────────────────────
+    current_imgs = (
+        await db.execute(
+            select(Imagen).where(
+                Imagen.imageable_type == "Comentario",
+                Imagen.imageable_id == str(comentario_id),
+            )
+        )
+    ).scalars().all()
+
+    valid_new_images = [f for f in imagenes if f.filename]
+    new_texto = (
+        texto.strip() if texto is not None else (comentario.texto or "")
+    )
+
+    remaining_existing = sum(1 for img in current_imgs if img.id not in delete_ids)
+    if not new_texto and remaining_existing == 0 and not valid_new_images:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="El comentario debe tener al menos un texto o una imagen.",
+        )
+
+    # ── Apply text ──────────────────────────────────────────────
+    comentario.texto = new_texto
+
+    # ── Remove marked images (row + file when unshared) ────────
+    for img in current_imgs:
+        if img.id in delete_ids:
+            await _delete_imagen_row(db, img)
+
+    # ── Add new images ──────────────────────────────────────────
+    for f in valid_new_images:
+        try:
+            rel = await save_upload(f, "comentarios", str(comentario_id))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=str(exc),
+            )
+        db.add(Imagen(
+            path=rel,
+            url=build_public_url(rel),
+            imageable_type="Comentario",
+            imageable_id=str(comentario_id),
+        ))
+
+    await db.commit()
+    await db.refresh(comentario)
+    await db.refresh(comentario, attribute_names=["autor"])
+    await _load_comentario_imagenes(db, comentario)
+
+    return Envelope(
+        message="Comentario actualizado",
+        data=_serialize_comentario(comentario),
+    )

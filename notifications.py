@@ -113,3 +113,48 @@ async def notify_users(user_ids, *, title, message, **kwargs) -> None:
         await send_push_via_onesignal(user_ids, title=title, message=message, **kwargs)
     except Exception as exc:
         logger.warning("notify_users failed: %s", exc)
+
+
+async def send_email_via_onesignal(
+    email: str,
+    *,
+    subject: str,
+    body: str,
+    preheader: str | None = None,
+) -> dict | None:
+    """Envía un email transaccional vía OneSignal (target_channel='email').
+
+    Devuelve el JSON de respuesta de OneSignal, o None si el envío está
+    deshabilitado (dev). Lanza RuntimeError si OneSignal responde >= 400.
+    """
+    if not (ONESIGNAL_ENABLED and ONESIGNAL_APP_ID and ONESIGNAL_REST_API_KEY):
+        logger.warning("[OneSignal EMAIL DISABLED] would send to %s: %s", email, subject)
+        return None
+
+    payload: dict = {
+        "app_id": ONESIGNAL_APP_ID,
+        "target_channel": "email",
+        # Formato clásico todavía soportado por la API REST de OneSignal
+        "include_email_tokens": [email],
+        "email_subject": subject,
+        "email_body": body,
+    }
+    if preheader:
+        payload["email_preheader"] = preheader
+
+    headers = {
+        "Authorization": f"Key {ONESIGNAL_REST_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(ONESIGNAL_URL, json=payload, headers=headers)
+
+    if resp.status_code >= 400:
+        logger.error("OneSignal email error %s: %s", resp.status_code, resp.text)
+        raise RuntimeError(f"OneSignal Email Error ({resp.status_code}): {resp.text}")
+
+    result = resp.json()
+    logger.info("OneSignal email ok: %s", result)
+    return result

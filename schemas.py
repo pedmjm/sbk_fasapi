@@ -60,6 +60,10 @@ class LoginRequest(BaseModel):
     email: EmailStr
     password: str
 
+class PasswordRecoveryRequest(BaseModel):
+    """Recuperación de contraseña: cédula (V-12345678 o 12345678) + email."""
+    cedula: str = Field(..., min_length=1, max_length=20)
+    email: EmailStr
 
 # ─── Personal ───────────────────────────────────────────────────────────────
 
@@ -260,6 +264,20 @@ class ComentarioOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+# ─── PasoEdicion ───────────────────────────────────────────────────────────
+
+class PasoEdicionOut(BaseModel):
+    id: uuid.UUID
+    paso_id: uuid.UUID
+    editor_id: Optional[uuid.UUID] = None
+    actividad_anterior: Optional[str] = None
+    metodo_anterior: Optional[str] = None
+    requerimiento_anterior: Optional[str] = None
+    created_at: datetime
+    editor: Optional[UserOut] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
 # ─── Pasos ─────────────────────────────────────────────────────────────────
 
 class PasoCreate(BaseModel):
@@ -284,9 +302,9 @@ class PasoOut(BaseModel):
     completado: bool
     created_at: datetime
     comentarios: list[ComentarioOut] = Field(default_factory=list)
+    ediciones: list[PasoEdicionOut] = Field(default_factory=list)   # historico de ediciones
 
     model_config = ConfigDict(from_attributes=True)
-
 
 # ─── Imagen ─────────────────────────────────────────────────────────────────
 

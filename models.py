@@ -717,7 +717,39 @@ class PasosTarea(Base):
         passive_deletes=True,
         order_by="Comentario.created_at",
     )
+    ediciones: Mapped[list["PasoEdicion"]] = relationship(
+        back_populates="paso",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="PasoEdicion.created_at.desc()",
+    )
 
+class PasoEdicion(Base):
+    """Snapshot de los valores anteriores de un paso, un registro por
+    edición de actividad/metodo/requerimiento (solo los que cambiaron)."""
+    __tablename__ = "paso_ediciones"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    paso_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("pasos_tarea.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    editor_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    actividad_anterior: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    metodo_anterior: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    requerimiento_anterior: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    paso: Mapped["PasosTarea"] = relationship(back_populates="ediciones")
+    editor: Mapped[Optional["User"]] = relationship()
 
 class Comentario(Base):
     """A comment on a Tarea's Paso (step). May contain text, image(s), or both.

@@ -55,6 +55,7 @@ from models import (
     Imagen,
     MensajeChat,
     PasosTarea,
+    PasoEdicion,
     Personal,
     Prioridad,
     Sucursal,
@@ -99,12 +100,41 @@ async def _load_tarea_relations(db: AsyncSession, tarea: Tarea) -> None:
         tarea,
         attribute_names=[
             "cliente", "sucursal", "creador",
-            "personal", "herramientas", "consumibles", 
-            "pasos", "comentarios"
+            "personal", "herramientas", "consumibles",
+            "pasos", "comentarios",
         ],
     )
-    # Comentarios' imagenes + tarea's own imagenes — loaded via explicit
-    # queries because the polymorphic relation is viewonly.
+
+    # ── NEW: cargar `ediciones` de TODOS los pasos en una sola query ──
+    # Sin esto, Pydantic triggera lazy load sobre `paso.ediciones` al
+    # serializar → MissingGreenlet en async. Igual patrón que se usa para
+    # `imagenes_proxy` (relación viewonly) o `comentarios` (set_committed).
+    paso_ids = [p.id for p in tarea.pasos]
+    if paso_ids:
+        all_ediciones = (
+            await db.execute(
+                select(PasoEdicion)
+                .options(selectinload(PasoEdicion.editor))
+                .where(PasoEdicion.paso_id.in_(paso_ids))
+                .order_by(PasoEdicion.created_at.desc())
+            )
+        ).scalars().all()
+
+        ediciones_by_paso: dict[uuid.UUID, list[PasoEdicion]] = {}
+        for e in all_ediciones:
+            ediciones_by_paso.setdefault(e.paso_id, []).append(e)
+
+        for p in tarea.pasos:
+            set_committed_value(
+                p, "ediciones", ediciones_by_paso.get(p.id, [])
+            )
+    else:
+        # Tarea sin pasos: nada que cargar, pero nos aseguramos de que el
+        # atributo esté "committed" para que Pydantic no lo intente cargar.
+        for p in tarea.pasos:  # normalmente no entra aquí
+            set_committed_value(p, "ediciones", [])
+
+    # ── Comentarios' imagenes + tarea's own imagenes ──
     tarea_imagenes = (
         await db.execute(
             select(Imagen)
@@ -123,7 +153,6 @@ async def _load_tarea_relations(db: AsyncSession, tarea: Tarea) -> None:
             )
         ).scalars().all()
         c.imagenes_proxy = c_imagenes  # type: ignore[attr-defined]
-
 
 def _serialize_tarea(tarea: Tarea) -> TareaNested:
     """Build the nested response, attaching the polymorphic images."""
@@ -213,6 +242,8 @@ async def list_tareas(
             selectinload(Tarea.personal),
             selectinload(Tarea.herramientas),
             selectinload(Tarea.pasos),
+            selectinload(Tarea.pasos).selectinload(PasosTarea.ediciones).selectinload(PasoEdicion.editor),
+            selectinload(Tarea.pasos).selectinload(PasosTarea.comentarios),
             selectinload(Tarea.comentarios).selectinload(Comentario.autor),
         )
         .order_by(Tarea.created_at.desc())

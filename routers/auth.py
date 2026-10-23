@@ -21,8 +21,10 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
+import secrets
+import logging
 
 from auth import (
     create_access_token,
@@ -32,9 +34,41 @@ from auth import (
 )
 from database import get_db
 from models import Personal, User
-from schemas import LoginRequest, Token, UserCreate, UserOut
+from schemas import LoginRequest, Token, UserCreate, UserOut, Envelope, PasswordRecoveryRequest
+# from notifications import send_email_via_onesignal
+from email_smtp import send_email_smtp
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+logger = logging.getLogger("sbk.pass_reset")
+
+def _generate_password(length: int = 8) -> str:
+    """Contraseña corta y legible: sin caracteres ambiguos (0/O, 1/l/I)."""
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def _build_recovery_email_html(name: str, password: str) -> str:
+    return f"""
+    <body style="font-family:'Helvetica Neue',Arial,sans-serif;font-size:16px;
+                 color:#424d57;line-height:1.7;max-width:560px;margin:0 auto;padding:24px">
+      <h2 style="color:#1a1a2e;margin:0 0 16px">Recuperación de contraseña</h2>
+      <p>Hola <strong>{name}</strong>,</p>
+      <p>Recibimos una solicitud para restablecer tu contraseña en <strong>SBK</strong>.</p>
+      <p>Tu nueva contraseña temporal es:</p>
+      <div style="background:#f4f6fa;border:1px solid #d8dee9;border-radius:8px;
+                  padding:16px;text-align:center;margin:20px 0;
+                  font-size:24px;letter-spacing:4px;
+                  font-family:'Courier New',monospace;color:#1a1a2e;font-weight:bold; 
+                  user-select: all; -webkit-user-select: all;">
+          {password}
+      </div>
+      <p>Por seguridad, te recomendamos cambiar esta contraseña después de iniciar sesión.</p>
+      <p style="color:#7a8699;font-size:13px;border-top:1px solid #e1e5eb;
+                padding-top:16px;margin-top:24px">
+        Si no solicitaste este cambio, contacta inmediatamente al administrador del sistema.
+      </p>
+    </body>
+    """
 
 
 @router.post("/register", response_model=Token, status_code=status.HTTP_201_CREATED)
@@ -182,3 +216,64 @@ async def me(
 ):
     return current_user
 
+
+@router.post("/recover-password", response_model=Envelope)
+async def recover_password(
+    body: PasswordRecoveryRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Envía una nueva contraseña temporal por correo.
+
+    Reglas de seguridad:
+      * Se verifica **email + cédula** (los dígitos, sin prefijo).
+      * La respuesta es SIEMPRE la misma (no filtra si el usuario existe).
+      * El correo se envía ANTES de persistir: si falla, no se cambia el hash.
+      * Al persistir, se incrementa `token_version` → todas las sesiones
+        activas del usuario quedan invalidadas.
+    """
+    generic_msg = (
+        "Si los datos coinciden con un usuario registrado, "
+        "recibirás tu nueva contraseña en el correo indicado."
+    )
+
+    # ── 1. Buscar usuario por email (case-insensitive) ─────────────
+    email = body.email.strip().lower()
+    user = (
+        await db.execute(
+            select(User).where(func.lower(User.email) == email)
+        )
+    ).scalar_one_or_none()
+
+    # ── 2. Verificar cédula (solo dígitos, acepta V- / E- / etc.) ──
+    if user:
+        db_cedula = "".join(ch for ch in (user.cedula or "") if ch.isdigit())
+        in_cedula = "".join(ch for ch in body.cedula.strip() if ch.isdigit())
+        if not db_cedula or not in_cedula or db_cedula != in_cedula:
+            user = None
+
+    if not user or user.disabled:
+        return Envelope(message=generic_msg)
+
+    # ── 3. Generar contraseña temporal ─────────────────────────────
+    new_password = _generate_password(8)
+
+    # ── 4. Enviar email PRIMERO (con la contraseña en memoria) ─────
+    try:
+        await send_email_smtp(
+            user.email,
+            subject="Recuperación de contraseña - SBK",
+            html_body=_build_recovery_email_html(user.name, new_password),
+        )
+    except Exception as exc:
+        logger.error("Error enviando email de recuperación a %s: %s", user.email, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo enviar el correo. Intenta más tarde.",
+        )
+
+    # ── 5. Persistir (hash + invalidar tokens) ─────────────────────
+    user.hashed_password = hash_password(new_password)
+    user.token_version += 1
+    await db.commit()
+
+    return Envelope(message=generic_msg)
